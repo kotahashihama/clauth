@@ -200,6 +200,7 @@ fn ctx_with_herdr(herdr: HerdrSeam) -> Arc<ApiContext> {
         None,
         crate::daemon::api::panes::absent_probe(),
         herdr,
+        crate::daemon::api::terminal::unspawnable_terminal(),
     )
 }
 
@@ -213,6 +214,7 @@ fn req(method: &str, path: &str, bearer: Option<&str>, body: &str) -> Request {
         if_none_match: None,
         body: body.as_bytes().to_vec(),
         keep_alive: true,
+        ws: Default::default(),
     }
 }
 
@@ -621,7 +623,11 @@ fn a_status_frame_frames_the_pretty_feed_line_by_line() {
         active_profile: Some("alpha".to_string()),
         pending_switch: None,
         wrap_off: false,
+        active_codex_profile: None,
+        codex_fallback_chain: Vec::new(),
+        codex_wrap_off: false,
         refresh_interval_ms: 120_000,
+        clauth_version: env!("CARGO_PKG_VERSION").to_string(),
         profiles: Vec::new(),
     };
     let bytes = serde_json::to_vec_pretty(&body).expect("pretty feed");

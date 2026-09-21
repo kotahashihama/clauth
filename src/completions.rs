@@ -14,7 +14,7 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
     if [ "$COMP_CWORD" -eq 1 ]; then
         local profiles
         profiles=$(clauth __complete 2>/dev/null)
-        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "${profiles} start login capture delete disable enable rolling-token static-token which list jobs switch sessions resume info daemon devices status mcp herdr completions --theme" -- "${cur}") )
     elif [ "$prev" = "--theme" ]; then
         COMPREPLY=( $(compgen -W "full compatible" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "login" ] && [ "${cur:0:2}" = "--" ]; then
@@ -35,12 +35,21 @@ const BASH_TEMPLATE: &str = r#"_clauth() {
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "sessions" ]; then
         COMPREPLY=( $(compgen -W "--json --tokens" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "switch" ]; then
+        local profiles sids
+        profiles=$(clauth __complete 2>/dev/null)
+        sids=$(clauth __complete --live-sessions 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles} ${sids}" -- "${cur}") )
+    elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "switch" ]; then
+        local profiles
+        profiles=$(clauth __complete 2>/dev/null)
+        COMPREPLY=( $(compgen -W "${profiles}" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "jobs" ]; then
         COMPREPLY=( $(compgen -W "--json" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "devices" ]; then
-        COMPREPLY=( $(compgen -W "pair add revoke --json" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "pair add revoke allow-sessions --json" -- "${cur}") )
     elif [ "${COMP_WORDS[1]}" = "devices" ] && { [ "${COMP_WORDS[2]}" = "pair" ] || [ "${COMP_WORDS[2]}" = "add" ]; } && [ "${cur:0:2}" = "--" ]; then
-        COMPREPLY=( $(compgen -W "--control" -- "${cur}") )
+        COMPREPLY=( $(compgen -W "--control --sessions" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 2 ] && [ "$prev" = "herdr" ]; then
         COMPREPLY=( $(compgen -W "install uninstall config" -- "${cur}") )
     elif [ "$COMP_CWORD" -eq 3 ] && [ "${COMP_WORDS[1]}" = "herdr" ] && [ "${COMP_WORDS[2]}" = "config" ]; then
@@ -87,11 +96,12 @@ _clauth() {
             'which[print profile owning the loaded credentials]' \
             'list[list accounts as a table with per-profile usage]' \
             'jobs[list the delegate jobs clauth is holding (add --json)]' \
+            'switch[switch the global account, or move a live session to another profile]' \
             'sessions[list Claude Code sessions (add --json / --tokens)]' \
             'resume[resume a session under a chosen profile]' \
             'info[print resume command + storage path for a session]' \
             'daemon[run the headless scheduler with no TUI]' \
-            'devices[pair, list and revoke the devices that may call the REST API]' \
+            'devices[pair, list, grant sessions to, and revoke the devices that may call the REST API]' \
             'status[print the usage / auto-switch snapshot as JSON]' \
             'mcp[run the stdio MCP server]' \
             'herdr[install the herdr plugin and bind a key to it]' \
@@ -130,15 +140,27 @@ _clauth() {
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == devices ]]; then
         _values 'subcommand' 'pair[print a one-time pairing code and wait for it]' \
             'add[mint a token for a device here and print it once]' \
-            'revoke[remove a device]'
+            'revoke[remove a device]' \
+            'allow-sessions[grant a control device the sessions flag]'
         _values 'flag' '--json[emit the device list as JSON]'
     elif (( CURRENT >= 4 )) && [[ "${words[2]}" == devices && "${words[3]}" == (pair|add) ]]; then
-        _values 'flag' '--control[the device may switch accounts, not only read]'
+        _values 'flag' '--control[the device may switch accounts, not only read]' \
+            '--sessions[the device may mint sessions through the API]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == which ]]; then
         _values 'flag' '--json[emit JSON instead of plain name]'
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == sessions ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]' \
             '--tokens[add token totals + cost; reads every transcript in full]'
+    elif (( CURRENT == 3 )) && [[ "${words[2]}" == switch ]]; then
+        local -a profiles sids
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        sids=("${(@f)$(clauth __complete --live-sessions 2>/dev/null)}")
+        _describe 'profile' profiles
+        _describe 'session' sids
+    elif (( CURRENT == 4 )) && [[ "${words[2]}" == switch ]]; then
+        local -a profiles
+        profiles=("${(@f)$(clauth __complete 2>/dev/null)}")
+        _describe 'profile' profiles
     elif (( CURRENT == 3 )) && [[ "${words[2]}" == jobs ]]; then
         _values 'flag' '--json[emit the stable machine-readable array]'
     elif (( CURRENT >= 3 )) && [[ "${words[2]}" == resume ]]; then
@@ -173,6 +195,9 @@ _clauth "$@"
 const FISH_TEMPLATE: &str = r#"function __clauth_profiles
     clauth __complete 2>/dev/null
 end
+function __clauth_sessions
+    clauth __complete --live-sessions 2>/dev/null
+end
 complete -c clauth -f
 complete -c clauth -f -n __fish_is_first_token -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n __fish_is_first_token -a start -d "Launch claude with that profile's runtime"
@@ -186,12 +211,13 @@ complete -c clauth -f -n __fish_is_first_token -a static-token -d "Restore the s
 complete -c clauth -f -n __fish_is_first_token -a which -d "Print profile owning the loaded credentials"
 complete -c clauth -f -n __fish_is_first_token -a list -d "List accounts as a table with per-profile usage"
 complete -c clauth -f -n __fish_is_first_token -a jobs -d "List the delegate jobs clauth is holding"
+complete -c clauth -f -n __fish_is_first_token -a switch -d "Switch the global account, or move a live session to another profile"
 complete -c clauth -f -n __fish_is_first_token -a sessions -d "List Claude Code sessions"
 complete -c clauth -f -n __fish_is_first_token -a resume -d "Resume a session under a chosen profile"
 complete -c clauth -f -n __fish_is_first_token -a info -d "Print resume command + storage path"
 complete -c clauth -f -n __fish_is_first_token -a completions -d "Emit shell completion script"
 complete -c clauth -f -n __fish_is_first_token -a daemon -d "Run the headless scheduler with no TUI"
-complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list and revoke the devices that may call the REST API"
+complete -c clauth -f -n __fish_is_first_token -a devices -d "Pair, list, grant sessions to, and revoke the devices that may call the REST API"
 complete -c clauth -f -n __fish_is_first_token -a status -d "Print the usage / auto-switch snapshot as JSON"
 complete -c clauth -f -n __fish_is_first_token -a mcp -d "Run the stdio MCP server"
 complete -c clauth -f -n __fish_is_first_token -a herdr -d "Install the herdr plugin, read its knobs, or uninstall it"
@@ -214,6 +240,9 @@ complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --auto -d "Pick 
 complete -c clauth -f -n "__fish_seen_subcommand_from start" -a --explain -d "Print the account that would be launched, without launching"
 complete -c clauth -f -n "__fish_seen_subcommand_from which" -a --json -d "Emit JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --json -d "Emit the stable machine-readable array"
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_profiles)" -d Profile
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -lt 3" -a "(__clauth_sessions)" -d Session
+complete -c clauth -f -n "__fish_seen_subcommand_from switch; and test (count (commandline -opc)) -ge 3" -a "(__clauth_profiles)" -d Profile
 complete -c clauth -f -n "__fish_seen_subcommand_from jobs" -a --json -d "Emit the stable machine-readable array"
 complete -c clauth -f -n "__fish_seen_subcommand_from sessions" -a --tokens -d "Add token totals + cost; reads every transcript in full"
 complete -c clauth -f -n "__fish_seen_subcommand_from resume" -a --profile -d "Resume under this profile instead of prompting"
@@ -242,8 +271,10 @@ complete -c clauth -f -n "__fish_seen_subcommand_from daemon" -a --dump-openapi 
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a pair -d "Print a one-time pairing code and wait for it"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a add -d "Mint a token for a device here and print it once"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a revoke -d "Remove a device"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a allow-sessions -d "Grant a control device the sessions flag"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices" -a --json -d "Emit the device list as JSON"
 complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --control -d "The device may switch accounts, not only read"
+complete -c clauth -f -n "__fish_seen_subcommand_from devices; and __fish_seen_subcommand_from pair add" -a --sessions -d "The device may mint sessions through the API"
 "#;
 
 /// The placeholder each script carries where its `login` flag list goes; the
@@ -262,6 +293,11 @@ const ZSH_LOGIN_DESCS: &[(&str, &str)] = &[
         "--setup-token",
         "capture a claude setup-token mint as a long-lived login",
     ),
+    ("--codex", "create or re-authenticate a codex profile"),
+    (
+        "--browser",
+        "with --codex: mint a fresh codex chain via the browser",
+    ),
     ("--yes", "replace an existing long-lived token unprompted"),
     ("-y", "replace an existing long-lived token unprompted"),
     ("--model", "set the default model before signing in"),
@@ -273,6 +309,11 @@ const FISH_LOGIN_DESCS: &[(&str, &str)] = &[
     (
         "--setup-token",
         "Capture a claude setup-token mint as a long-lived login",
+    ),
+    ("--codex", "Create or re-authenticate a codex profile"),
+    (
+        "--browser",
+        "With --codex: mint a fresh codex chain via the browser",
     ),
     ("--yes", "Replace an existing long-lived token unprompted"),
     ("-y", "Replace an existing long-lived token unprompted"),
@@ -337,6 +378,40 @@ pub(crate) fn print_profile_names() {
     };
     for name in config.names() {
         outln!("{name}");
+    }
+}
+
+/// Live-session id stems for `clauth switch`'s first completion position: the
+/// filenames under `~/.clauth/live_sessions/` minus their `.json`, never a
+/// transcript read. The dir derives from the same [`crate::profile::clauth_dir`]
+/// base the registry writer keys its rows on, so the listing and the writer
+/// cannot drift onto different paths. Sorted so the order a shell shows is
+/// stable; a missing or unreadable dir answers empty, never an error, like
+/// [`print_profile_names`].
+fn live_session_stems() -> Vec<String> {
+    let Ok(dir) = crate::profile::clauth_dir().map(|home| home.join("live_sessions")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut stems: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.strip_suffix(".json"))
+                .map(str::to_string)
+        })
+        .collect();
+    stems.sort();
+    stems
+}
+
+pub(crate) fn print_session_stems() {
+    for stem in live_session_stems() {
+        outln!("{stem}");
     }
 }
 

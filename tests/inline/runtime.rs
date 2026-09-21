@@ -3,7 +3,7 @@ use super::*;
 use std::fs;
 use std::time::{Duration, SystemTime};
 
-use crate::testutil::{HomeSandbox, set_mtime};
+use crate::testutil::{HomeSandbox, hold_rotation_lock, set_mtime};
 
 // V1 expires_at < V2 so tie-break tests can assert which side wins unambiguously.
 const CREDS_V1: &[u8] = br#"{"claudeAiOauth":{"accessToken":"tok1","expiresAt":1000}}"#;
@@ -2832,6 +2832,49 @@ fn acquire_creates_runtime_and_pid_file() {
     });
 }
 
+/// The wipe-HAPPENS half of the acquire-side stale-tree rule: a tree already
+/// sitting at the path a session resolves, with NO live marker in its paired
+/// sessions dir, is wiped before the build, so a dead session's leftovers do
+/// not carry into this session's tree. The stale entry is a regular file with
+/// no counterpart in `~/.claude` (empty here), so neither the additive build
+/// walk nor `prune_dangling_links` can remove it — only the wipe can, which
+/// is what makes this a wipe pin rather than a build pin. Forced Fake
+/// transport because the shared bare-stem tree gives the fixture a FIXED
+/// runtime path to pre-populate; the wipe itself is mode-independent.
+#[test]
+fn acquire_wipes_a_stale_tree_at_its_own_path_when_no_marker_holds_it() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        with_link_mode(LinkMode::Fake, || {
+            fake_claude_home(tmp.path());
+            let profile = configured_profile("stale");
+
+            let runtime = tmp
+                .path()
+                .join(".clauth")
+                .join("profiles")
+                .join("stale")
+                .join("runtime");
+            fs::create_dir_all(&runtime).expect("mkdir stale runtime");
+            fs::write(runtime.join("leftover-of-a-dead-session"), b"stale bytes")
+                .expect("seed the stale entry");
+
+            let rt =
+                ProfileRuntime::acquire(&profile, Isolation::Shared, &[], false).expect("acquire");
+
+            assert_eq!(
+                rt.config_dir(),
+                runtime,
+                "under the forced shared fake transport the tree is the bare stem"
+            );
+            assert!(
+                !runtime.join("leftover-of-a-dead-session").exists(),
+                "a stale tree with no live marker holding it is wiped, not adopted"
+            );
+        });
+    });
+}
+
 /// The window row 2 of the lock-race backlog names: a caller loads config, the
 /// acquire's rotation-lock wait parks it, a delete lands, and the acquire then
 /// rebuilds a whole session for an account nothing configures. The wait's own
@@ -3712,20 +3755,6 @@ fn teardown_retries_a_persistent_wedge_then_gives_up() {
         set_teardown_timeout_hook(None);
         crate::lock::set_state_lock_timeout_override(None);
     });
-}
-
-/// A locked handle on `name`'s rotation lock from a separate fd, standing in for
-/// another process mid-rotation — `flock(2)` binds to the open file description,
-/// so this genuinely contends with the acquire's own. Creates the locks directory
-/// the way `RotationGuard::open` does, since a real holder made it on its way in.
-/// Call INSIDE [`with_fake_home`].
-fn hold_rotation_lock(name: &str) -> std::fs::File {
-    let path =
-        crate::runtime::rotation_lock_path(&crate::profile::ProfileName::from(name)).expect("path");
-    crate::profile::mkdir_700(path.parent().expect("lock parent")).expect("locks dir");
-    let holder = crate::profile::open_state_file(&path).expect("open holder handle");
-    holder.lock().expect("hold the rotation lock");
-    holder
 }
 
 /// A wedge on the rotation lock ends the start with a NAMED failure instead of an
@@ -5203,6 +5232,11 @@ fn gc_leaves_profile_children_that_only_look_like_runtime_dirs() {
             "sessions.json",
             "runtime-isolatedish",
             "runtime-4242-x",
+            // The BARE codex store stem: outside the runtime*/sessions* stems
+            // BY DESIGN, and not a per-session home either, so no GC touches
+            // it. (A per-session codex-home-<sid> IS collected by
+            // gc_codex_homes — see gc_collects_a_dead_codex_home_*.)
+            "codex-home",
         ];
         for name in bystanders {
             let path = profile.join(name);
@@ -5423,12 +5457,13 @@ fn gc_collects_an_orphaned_sessions_dir_with_no_runtime_sibling() {
 /// collected tree's item goes with the tree, a live session's item never
 /// does, and a dir that was never built has no item to collect. The macOS
 /// executor that this decision feeds (derive the service while the dir
-/// exists, delete after the state-flock closure) is unreachable under
-/// `cfg(test)` (`keychain::enabled()` is false there), the same split the
-/// seed and swap arms record; what every platform CAN pin is the decision
-/// itself and that the sweep's own filesystem outcome feeds it the right
-/// inputs — the crashed tree below is collected, so the dir the delete keys
-/// on is gone, and the live one is spared, so its dir stands.
+/// exists, re-check liveness under a state-lock hold taken immediately
+/// before the delete) is unreachable under `cfg(test)` (`keychain::enabled()`
+/// is false there), the same split the seed and swap arms record; what every
+/// platform CAN pin is the decision itself and that the sweep's own
+/// filesystem outcome feeds it the right inputs — the crashed tree below is
+/// collected, so the inputs the delete keys on read dead, and the live one
+/// is spared, so they read live.
 #[test]
 fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -5473,10 +5508,12 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
 
         gc_stale_runtimes();
 
-        // The decision the macOS executor takes on the post-sweep state.
+        // The decision the macOS executor takes on the post-sweep state,
+        // with the marker count sampled the way its re-check samples it.
         assert_eq!(
             orphaned_keychain_item(
                 Some(crashed_service.as_str()),
+                prune_stale_sessions(&crashed_sessions),
                 crashed_runtime.symlink_metadata().is_ok()
             ),
             Some(crashed_service.as_str()),
@@ -5485,6 +5522,7 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
         assert_eq!(
             orphaned_keychain_item(
                 Some(live_service.as_str()),
+                prune_stale_sessions(&live_sessions),
                 live_runtime.symlink_metadata().is_ok()
             ),
             None,
@@ -5495,7 +5533,7 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
             "the never-built marker dir is collected alongside"
         );
         assert_eq!(
-            orphaned_keychain_item(None, false),
+            orphaned_keychain_item(None, Some(0), false),
             None,
             "no tree was ever built, so no service exists to collect"
         );
@@ -5504,16 +5542,87 @@ fn gc_collects_a_crashed_sessions_keychain_item_and_spares_a_live_one() {
 }
 
 /// The truth table for the item-collection decision on its own: the derived
-/// service survives only when the dir that explains it does not. Every other
-/// row keeps the item — a live or uncollectable tree keeps its dir, and a dir
-/// that never existed has no item to collect.
+/// service survives only when nothing live explains the item — no flock-held
+/// marker in the paired sessions dir, and no dir at its path. Every other row
+/// keeps the item: a live or uncollectable tree keeps its dir, a live or
+/// unreadable marker count reads as live, and a dir that never existed has no
+/// item to collect.
 #[test]
 fn orphaned_keychain_item_follows_the_dir() {
     let service = Some("Claude Code-credentials-c56fc9bd");
-    assert_eq!(orphaned_keychain_item(service, false), service);
-    assert_eq!(orphaned_keychain_item(service, true), None);
-    assert_eq!(orphaned_keychain_item(None, false), None);
-    assert_eq!(orphaned_keychain_item(None, true), None);
+    let dead = Some(0);
+    assert_eq!(orphaned_keychain_item(service, dead, false), service);
+    assert_eq!(orphaned_keychain_item(service, dead, true), None);
+    assert_eq!(orphaned_keychain_item(None, dead, false), None);
+    assert_eq!(orphaned_keychain_item(None, dead, true), None);
+    // The #82 rows: a marker a re-minted acquire holds spares the item even
+    // before the dir is rebuilt, and an unreadable sessions dir reads as
+    // live, the same fail-closed fold every destructive level makes.
+    assert_eq!(orphaned_keychain_item(service, Some(1), false), None);
+    assert_eq!(orphaned_keychain_item(service, Some(1), true), None);
+    assert_eq!(orphaned_keychain_item(service, None, false), None);
+}
+
+/// Issue #82's interleaving, posed through the seam between the sweep's
+/// collection closure and its item delete: a concurrently starting session
+/// re-mints the collected path while the sweep sits between the two, so its
+/// lock section has completed — marker claimed and flock-held — with the
+/// runtime dir not yet rebuilt, the corner where only the marker can spare
+/// the item (a rebuilt dir would spare it on the stat alone). The decision is
+/// evaluated on the inputs the macOS executor samples immediately before the
+/// delete: a live marker must outrank dir absence, or the delete lands after
+/// the re-minted acquire's seed and destroys the item it just wrote.
+#[test]
+fn gc_spares_the_keychain_item_a_reminted_acquire_claims_mid_sweep() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let profiles = tmp.path().join(".clauth").join("profiles");
+
+        // A crashed pair: dead marker, tree present — what the sweep collects.
+        let runtime = profiles.join("crashed").join("runtime-4242-0");
+        let sessions = profiles.join("crashed").join("sessions-4242-0");
+        fs::create_dir_all(&runtime).expect("mkdir runtime");
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        fs::write(runtime.join(".claude.json"), b"{}").expect("seed runtime");
+        fs::write(sessions.join("4242-0"), b"").expect("dead marker");
+
+        let service = crate::claude::namespaced_keychain_service(
+            &runtime.canonicalize().expect("canonicalize"),
+        );
+
+        // The re-mint, landing between the collection and the delete: the
+        // acquire's lock section leaves a flock-held marker (the claim) and,
+        // at this corner, no runtime dir. The fd is held past the sweep, the
+        // way a live session's acquire holds it.
+        let mut reminted: Option<std::fs::File> = None;
+        gc_one_pair_synced(&runtime, &sessions, || {
+            fs::create_dir_all(&sessions).expect("re-mint the sessions dir");
+            let held = open_pid_file(&sessions.join("4242-0")).expect("open re-minted marker");
+            held.lock().expect("flock-hold the re-minted marker");
+            reminted = Some(held);
+        })
+        .expect("gc one pair");
+
+        // The collection half ran before the interleave posed the re-mint.
+        assert!(
+            !runtime.exists(),
+            "the tree was collected ahead of the re-mint the seam poses"
+        );
+        // The decision the macOS executor takes on the re-checked world,
+        // sampled the way it samples under its re-take of the state lock:
+        // spared — a live marker outranks dir absence.
+        assert_eq!(
+            orphaned_keychain_item(
+                Some(service.as_str()),
+                prune_stale_sessions(&sessions),
+                runtime.symlink_metadata().is_ok()
+            ),
+            None,
+            "a marker a re-minted acquire flock-holds outranks dir absence: \
+             the item it is about to seed stays"
+        );
+        drop(reminted);
+    });
 }
 
 /// The Plugin tab's boot probe must not collect trees: its 3 s kill budget
@@ -5662,6 +5771,7 @@ fn gc_drops_a_registry_row_whose_marker_is_unlocked_and_keeps_a_held_one() {
         let mut dead = crate::live_sessions::LiveSession {
             session_id: "6001-0".into(),
             start_profile: "rowdead".into(),
+            harness: crate::harness::Harness::Claude,
             pid: 6001,
             started_at: 1,
             cwd: None,
@@ -5913,6 +6023,7 @@ fn lone_session(
     let row = crate::live_sessions::LiveSession::starting(
         &session,
         name,
+        crate::harness::Harness::Claude,
         isolation == Isolation::Isolated,
         false,
         Some(store.to_path_buf()),
@@ -6120,7 +6231,8 @@ fn session_row_is_live_finds_the_marker_a_real_session_stamped() {
             !session_row_is_live(
                 &crate::profile::ProfileName::from("rowlive-a"),
                 false,
-                "9999-0"
+                // pid 0 is never minted: `mint` stamps `<pid>-<seq>` with the live pid.
+                "0-0"
             ),
             "an unstamped session id must read dead"
         );
@@ -7586,6 +7698,313 @@ fn a_standing_refusal_is_announced_once_per_reason() {
     });
 }
 
+// ── the in-place convergence (rolling-token arming under live sessions) ──────
+
+/// The issue-#84 shape: a session that launched before its profile was armed
+/// for rolling tokens holds the rotating pair, and arming changes only future
+/// starts. That session's own poll must detect the transition — its canonical
+/// still refreshable while the install source now selects a refreshless
+/// sidecar — and converge onto the sidecar in place, one poll, same member.
+#[test]
+fn a_pre_arming_session_converges_onto_the_armed_sidecar_on_one_poll() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        if !host_poses(tmp.path(), "a convergence relink") {
+            return;
+        }
+        let launch = member("conv-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        // Arm the profile under the live session.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "one poll repoints the session onto the armed sidecar"
+        );
+        assert_eq!(swap.canonical(), sidecar, "the cell follows the link");
+        assert_eq!(swap.member(), "conv-a", "the member does not change");
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member.as_deref(), Some("conv-a"));
+        assert_eq!(
+            row.launch_store.as_deref(),
+            Some(sidecar.as_path()),
+            "the row's launch_store names the sidecar, so the rotation refusal lifts"
+        );
+        assert!(
+            row.last_swap_at.is_some(),
+            "the convergence advances last_swap_at exactly like a swap"
+        );
+        // The item arm the convergence executes on macOS, pinned here through
+        // the pure seam: the bearer is signed out, never installed.
+        let creds = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(&sidecar)
+            .expect("read sidecar");
+        assert_eq!(converge_item_arm(Some(&creds)), SwapItemArm::SignOut);
+    });
+}
+
+/// Same member, same source: without an armed transition the poll is a no-op
+/// — no mtime move, no registry write, and no refusal recorded (the steady
+/// state is not news).
+#[test]
+fn a_convergence_does_not_move_a_session_without_an_armed_transition() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-noop-a");
+        let launch_store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        let before = SystemTime::now() - Duration::from_secs(60);
+        set_mtime(&launch_store, before);
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "conv-noop-a");
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            launch_store,
+            "no sidecar armed — there is nothing to converge onto"
+        );
+        assert_eq!(
+            fs::metadata(&launch_store)
+                .expect("meta")
+                .modified()
+                .expect("mtime"),
+            before,
+            "a no-op convergence must not move the store's mtime"
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None, "a no-op must not write the row");
+        assert_eq!(row.last_swap_at, None);
+        assert!(
+            swap.cell().last_refusal.is_none(),
+            "the steady state is not a refusal"
+        );
+    });
+}
+
+/// The admitted transition is rotatable-current → refreshless-selected only.
+/// A session already on the sidecar must not converge BACK onto the rotating
+/// store when the profile is disarmed — reverse convergence would re-strand
+/// the session on a login the re-stamp leg no longer owns.
+#[test]
+fn a_refreshless_session_does_not_converge_back_onto_the_rotating_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-rev-a");
+        register_profile(&launch);
+        // Armed BEFORE the fixture, so the session launches on the sidecar.
+        let sidecar = crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-rev-a"))
+            .expect("profile_dir")
+            .join("session-token.json");
+        write_creds(&sidecar, None);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+        let sid = swap.session.as_str().to_string();
+
+        // Disarm: the install source falls back to the rotating store.
+        fs::remove_file(&sidecar).expect("disarm");
+
+        swap.poll();
+
+        assert_eq!(swap.member(), "conv-rev-a");
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            sidecar,
+            "a refreshless current source never converges onto the rotating store"
+        );
+        let row = crate::live_sessions::get(&sid).expect("row");
+        assert_eq!(row.current_member, None);
+        assert_eq!(row.last_swap_at, None);
+    });
+}
+
+/// An unreadable current source admits nothing: the session stays put and the
+/// fail-closed rotation refusal stands (an unknown must never read as the
+/// armed transition).
+#[test]
+fn an_unreadable_current_source_does_not_converge() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("conv-torn-a");
+        let launch_store = member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        fs::write(&launch_store, b"not json").expect("corrupt the current source");
+        let sidecar =
+            crate::profile::profile_dir(&crate::profile::ProfileName::from("conv-torn-a"))
+                .expect("profile_dir")
+                .join("session-token.json");
+        write_creds(&sidecar, None);
+
+        swap.poll();
+
+        assert_eq!(
+            fs::read_link(swap.runtime.join(".credentials.json")).expect("read link"),
+            launch_store,
+            "an unreadable current source never moves"
+        );
+        let row = crate::live_sessions::get(swap.session.as_str()).expect("row");
+        assert_eq!(row.current_member, None);
+    });
+}
+
+/// The transition discriminator, pinned pure: only a refreshable current
+/// source with a DISTINCT refreshless selected source converges. Everything
+/// else — same source, reverse, refreshable-to-refreshable, and every
+/// unreadable shape — stays a no-op.
+#[test]
+fn a_convergence_admits_only_rotatable_current_to_refreshless_selected() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let rot = tmp.path().join("rot.json");
+    let rot2 = tmp.path().join("rot2.json");
+    let refreshless = tmp.path().join("sidecar.json");
+    let refreshless2 = tmp.path().join("sidecar2.json");
+    let torn = tmp.path().join("torn.json");
+    write_creds(&rot, Some("rt-1"));
+    write_creds(&rot2, Some("rt-2"));
+    write_creds(&refreshless, None);
+    write_creds(&refreshless2, None);
+    fs::write(&torn, b"not json").expect("write torn");
+
+    assert!(
+        converge_transition_holds(&rot, &refreshless),
+        "the armed transition is exactly what converges"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &rot),
+        "same member, same source stays a no-op"
+    );
+    assert!(
+        !converge_transition_holds(&refreshless, &rot),
+        "refreshless → rotatable (disarm) does not auto-converge"
+    );
+    assert!(
+        !converge_transition_holds(&refreshless, &refreshless2),
+        "a refreshless current source is not rotatable-current, however the \
+         selected source reads"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &rot2),
+        "rotatable → rotatable is not an armed transition"
+    );
+    assert!(
+        !converge_transition_holds(&torn, &refreshless),
+        "an unreadable current source does not move"
+    );
+    assert!(
+        !converge_transition_holds(&rot, &torn),
+        "an unreadable selected source does not move"
+    );
+    assert!(
+        !converge_transition_holds(&tmp.path().join("missing.json"), &refreshless),
+        "a missing current source does not move"
+    );
+}
+
+/// The item arm the convergence executes on macOS, pinned pure: the bearer is
+/// SIGNED OUT, never installed — installing a refreshless login would strand
+/// the session on a snapshot the re-stamp leg can no longer reach. The
+/// Install arms are unreachable by admission (the transition selects only a
+/// refreshless store) and stop the move fail-closed if ever reached.
+#[test]
+fn a_convergence_signs_the_item_out_and_never_installs() {
+    use crate::profile::{ClaudeCredentials, OAuthToken};
+    let store = |refresh: Option<&str>| ClaudeCredentials {
+        claude_ai_oauth: Some(OAuthToken {
+            access_token: "a".to_string(),
+            refresh_token: refresh.map(str::to_string),
+            expires_at: None,
+            scopes: None,
+            subscription_type: None,
+            ..OAuthToken::default_extra()
+        }),
+    };
+
+    assert_eq!(
+        converge_item_arm(Some(&store(None))),
+        SwapItemArm::SignOut,
+        "the bearer is signed out of the item, never installed"
+    );
+    assert_eq!(
+        converge_item_arm(Some(&store(Some("r")))),
+        SwapItemArm::Install
+    );
+    assert_eq!(converge_item_arm(None), SwapItemArm::Install);
+}
+
+/// The convergence Keychain legs' failure routing, pinned pure: the
+/// classified locked-keychain transient raises nothing — it is the steady
+/// state the next poll clears once the keychain unlocks, and a line per tick
+/// for its whole duration is the noise the seed's disposition pattern exists
+/// to avoid — while every other class goes through the announcement memo.
+#[test]
+fn a_convergence_keychain_failure_routes_the_locked_keychain_as_silent() {
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::InteractionNotAllowed),
+        ConvergeLegDisposition::Silent,
+        "the classified locked-keychain transient must not log per tick"
+    );
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::ItemNotFound),
+        ConvergeLegDisposition::Announce
+    );
+    assert_eq!(
+        converge_leg_disposition(crate::claude::SecurityExitClass::Unclassified),
+        ConvergeLegDisposition::Announce
+    );
+}
+
+/// The standing-failure memo the legs log behind, pinned through the same
+/// once-per-(member, reason) gate: a persistent non-transient failure
+/// announces once and stays silent across ticks until the class, the leg, or
+/// the member changes — a landed swap or convergence clears the memo, which
+/// `a_standing_refusal_is_announced_once_per_reason` already pins.
+#[test]
+fn a_convergence_keychain_failure_memo_silences_a_standing_fault() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let launch = member("carry-a");
+        member_store(&launch);
+        let (swap, _launch_markers) = lone_session(&launch, Isolation::Shared);
+
+        let carry =
+            SwapRefused::ConvergeCarryFailed(crate::claude::SecurityExitClass::ItemNotFound);
+        assert!(
+            swap.should_announce("carry-a", &carry),
+            "the first failure is news"
+        );
+        assert!(
+            !swap.should_announce("carry-a", &carry),
+            "the standing failure must not repeat every tick"
+        );
+        let changed_class =
+            SwapRefused::ConvergeCarryFailed(crate::claude::SecurityExitClass::Unclassified);
+        assert!(
+            swap.should_announce("carry-a", &changed_class),
+            "a changed class is news"
+        );
+        let sign_out =
+            SwapRefused::ConvergeSignOutFailed(crate::claude::SecurityExitClass::ItemNotFound);
+        assert!(
+            swap.should_announce("carry-a", &sign_out),
+            "a changed leg is news"
+        );
+        assert!(
+            !swap.should_announce("carry-a", &sign_out),
+            "the new reason is then the standing one"
+        );
+    });
+}
+
 // ── bare `claude` session markers ────────────────────────────────────────────
 
 /// The whole safety argument for counting bare sessions: their markers live
@@ -8177,6 +8596,7 @@ fn register_row(profile: &str, sid: &str, launch_store: Option<std::path::PathBu
     crate::live_sessions::register(&crate::live_sessions::LiveSession {
         session_id: sid.to_string(),
         start_profile: profile.to_string(),
+        harness: crate::harness::Harness::Claude,
         pid: std::process::id(),
         started_at: 1_700_000_000_000,
         cwd: None,
@@ -8354,6 +8774,1065 @@ fn rotation_blocked_for_reads_what_the_live_session_holds() {
             "the narrowing is not wired into rotation_blocked_for"
         );
     });
+}
+
+// ── the fan-out warning (P1) ─────────────────────────────────────────────────
+
+/// The exact warning fires only from two live sessions up: `<n>` is the
+/// observed live count including the session whose item write just landed,
+/// and the threshold is `n >= 2` — one session on its own rotating pair is
+/// the pre-arming norm, not a fan-out.
+#[test]
+fn a_fanout_warning_fires_at_two_and_three_live_sessions() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-a");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "one session on its own rotating pair is the pre-arming norm"
+        );
+
+        let _second = live_session_launched_on("fanout-a", "22222-1", &store);
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-a' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the second live session holding the rotating login is exactly the warning"
+        );
+
+        let _third = live_session_launched_on("fanout-a", "22222-2", &store);
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-a' has 3 live sessions sharing one rotating login; run `clauth rolling-token fanout-a` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the observed count includes every live holder"
+        );
+    });
+}
+
+/// Registry rows are the real thing, and a row whose session is gone drops by
+/// the same liveness predicate the tally/decision leg uses — never counted
+/// into a warning that names it as live.
+#[test]
+fn a_fanout_warning_ignores_dead_rows() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-dead");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // A row with no held marker: the session it names is gone.
+        register_row("fanout-dead", "33333-3", Some(store.clone()));
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "a dead row must not count a session the warning names as live"
+        );
+    });
+}
+
+/// A row whose launch_store names a refreshless sidecar holds no rotating
+/// login, so it never counts toward the fan-out.
+#[test]
+fn a_fanout_warning_ignores_rows_holding_a_refreshless_store() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-side");
+        let dir = crate::profile::profile_dir(&name).expect("profile_dir");
+        let store = dir.join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let sidecar = dir.join("session-token.json");
+        write_creds(&sidecar, None);
+        let session = SessionId::mint();
+
+        let _side = live_session_launched_on("fanout-side", "44444-4", &sidecar);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "a refreshless row holds no rotating login to share"
+        );
+    });
+}
+
+/// Attribution follows the tally: a row whose current/start profile is not
+/// this one is another account's session, however its store reads. The
+/// foreign row names THIS profile's store on purpose — the store-path check
+/// alone must not drop it, or a plant deleting the attribution check stays
+/// green.
+#[test]
+fn a_fanout_warning_ignores_rows_attributed_to_another_profile() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-a");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // Attributed to fanout-other but launch_store = fanout-a's store:
+        // only the attribution check can drop it from fanout-a's count.
+        let _foreign = live_session_launched_on("fanout-other", "55555-5", &store);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            None,
+            "another profile's session is not this profile's fan-out"
+        );
+    });
+}
+
+/// A failed item write created no new copy, so it must never raise the
+/// success-shaped warning — the decision is fed the write's own outcome.
+#[test]
+fn a_failed_item_write_never_raises_the_fanout_warning() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-fail");
+        let store = crate::profile::profile_dir(&name)
+            .expect("profile_dir")
+            .join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        let _other = live_session_launched_on("fanout-fail", "66666-6", &store);
+
+        assert_eq!(
+            fanout_warning(false, &name, &store, &session),
+            None,
+            "a failed write created no copy and must not warn like a landed one"
+        );
+    });
+}
+
+/// The swap Install arm's shape: the writing session's row still names its
+/// PREVIOUS store until the row repoint lands, so the count must include the
+/// writing session by construction rather than off its row.
+#[test]
+fn a_fanout_warning_counts_the_session_whose_write_landed_even_while_its_row_names_its_previous_store()
+ {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    with_fake_home(tmp.path(), || {
+        let name = crate::profile::ProfileName::from("fanout-swap");
+        let dir = crate::profile::profile_dir(&name).expect("profile_dir");
+        let store = dir.join("credentials.json");
+        write_creds(&store, Some("rt-live"));
+        let session = SessionId::mint();
+
+        // The writing session's own row names the outgoing member's store.
+        let previous = dir.join("previous.json");
+        write_creds(&previous, Some("rt-old"));
+        register_row("fanout-swap", session.as_str(), Some(previous));
+        let _other = live_session_launched_on("fanout-swap", "77777-7", &store);
+
+        assert_eq!(
+            fanout_warning(true, &name, &store, &session),
+            Some(
+                "clauth: warning: 'fanout-swap' has 2 live sessions sharing one rotating login; run `clauth rolling-token fanout-swap` before one refresh signs the others out"
+                    .to_string()
+            ),
+            "the observed count includes the session whose write just landed"
+        );
+    });
+}
+
+/// The isolated stores are CLAUDE stores by roster, not by directory shape: a
+/// codex profile's dir is skipped before its children are read — folded fix 4's
+/// membership half, now that the false dead_code attribute is gone
+/// (sessions.rs consumes this fn).
+#[test]
+fn live_isolated_stores_skip_codex_profiles_by_roster() {
+    let home = crate::testutil::HomeSandbox::new();
+    let mut locks = Vec::new();
+    for name in ["cl", "cx"] {
+        let projects = home
+            .home()
+            .join(format!(".clauth/profiles/{name}/runtime-isolated/projects"));
+        fs::create_dir_all(&projects).expect("mkdir projects");
+        let sessions = home
+            .home()
+            .join(format!(".clauth/profiles/{name}/sessions-isolated"));
+        fs::create_dir_all(&sessions).expect("mkdir sessions");
+        let lock = open_pid_file(&sessions.join("12345")).expect("open pid");
+        lock.lock().expect("lock pid");
+        locks.push(lock);
+    }
+    fs::write(
+        home.home().join(".clauth/codex-profiles.toml"),
+        "profiles = [\"cx\"]\n",
+    )
+    .expect("write codex roster");
+
+    let stores = live_isolated_stores();
+
+    assert_eq!(
+        stores.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>(),
+        ["cl"],
+        "the codex twin of an identically live-shaped store is not listed"
+    );
+}
+
+// ── codex session homes ──────────────────────────────────────────────────────
+
+/// The copied config.toml loses exactly the keys that would let the session read
+/// or write outside the home clauth just built — and nothing else. `sqlite_home`
+/// and `cli_auth_credentials_store` are also pinned by a forced `-c` at spawn;
+/// `debug.config_lockfile` is why that pin alone is not enough, since a lockfile
+/// replay rebuilds the config from ONE layer and erases the `-c` layer entirely.
+#[cfg(unix)]
+#[test]
+fn a_session_config_loses_the_keys_that_escape_the_home() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    fs::write(
+        operator.join("config.toml"),
+        b"model = \"o3\"\n\
+          sqlite_home = \"/tmp/one-shared-dir\"\n\
+          cli_auth_credentials_store = \"keyring\"\n\
+          \n[debug.config_lockfile]\n\
+          load_path = \"/tmp/replay.lock\"\n\
+          \n[tui]\n\
+          notifications = true\n",
+    )
+    .expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let copied = fs::read_to_string(session_home.join("config.toml")).expect("read copy");
+    let parsed: toml::Value = toml::from_str(&copied).expect("the rewrite is still valid TOML");
+    let table = parsed.as_table().expect("table");
+    assert!(
+        table.get("sqlite_home").is_none(),
+        "the state-DB escape is gone: {copied}"
+    );
+    assert!(
+        table.get("cli_auth_credentials_store").is_none(),
+        "the credential-store escape is gone: {copied}"
+    );
+    assert!(
+        table
+            .get("debug")
+            .and_then(toml::Value::as_table)
+            .map(|d| d.get("config_lockfile").is_none())
+            .unwrap_or(true),
+        "the lockfile replay that erases the -c layer is gone: {copied}"
+    );
+    assert_eq!(
+        table.get("model").and_then(toml::Value::as_str),
+        Some("o3"),
+        "every key that is not an escape survives"
+    );
+    assert_eq!(
+        table
+            .get("tui")
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("notifications"))
+            .and_then(toml::Value::as_bool),
+        Some(true),
+        "including whole tables the strip does not name"
+    );
+}
+
+/// A config clauth cannot parse copies through untouched. codex will reject it
+/// the same way, and a session that refuses to start beats one silently reshaped
+/// by a parse that got it wrong.
+#[cfg(unix)]
+#[test]
+fn an_unparseable_operator_config_copies_through_verbatim() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let broken = "model = \"o3\n[unclosed\n";
+    fs::write(operator.join("config.toml"), broken).expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    assert_eq!(
+        fs::read_to_string(session_home.join("config.toml")).expect("read copy"),
+        broken,
+        "byte-for-byte, not a best-effort reshape"
+    );
+}
+
+/// The copy lands owner-only whatever the operator's mode, strip or no strip:
+/// it sits in a tree the perms sweep stops short of, so nothing downstream
+/// retightens a 0644 it inherited. The bytes are pinned on every platform;
+/// only the mode reads are unix.
+#[test]
+fn a_copied_config_is_owner_only_whatever_the_operators_mode() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(&operator).expect("mkdir operator");
+    let plain = "model = \"o3\"\n[tui]\nnotifications = true\n";
+    fs::write(operator.join("config.toml"), plain).expect("write config");
+    let escaping = "model = \"o3\"\nsqlite_home = \"/tmp/shared\"\n";
+    fs::write(operator.join("work.config.toml"), escaping).expect("write layer");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["config.toml", "work.config.toml"] {
+            fs::set_permissions(operator.join(name), fs::Permissions::from_mode(0o644))
+                .expect("loosen the operator's copy");
+        }
+    }
+
+    let session_home = home.home().join(".clauth/profiles/cx/codex-home-4242-0");
+    let plain_dst = session_home.join("config.toml");
+    let stripped_dst = session_home.join("work.config.toml");
+    copy_codex_config(&operator.join("config.toml"), &plain_dst).expect("copy plain");
+    copy_codex_config(&operator.join("work.config.toml"), &stripped_dst).expect("copy stripped");
+
+    assert_eq!(
+        fs::read_to_string(&plain_dst).expect("read copy"),
+        plain,
+        "no escape key, so the bytes are the operator's"
+    );
+    let stripped: toml::Value =
+        toml::from_str(&fs::read_to_string(&stripped_dst).expect("read copy")).expect("valid TOML");
+    assert!(
+        stripped.get("sqlite_home").is_none(),
+        "the escape key is gone: {stripped}"
+    );
+    assert_eq!(
+        stripped.get("model").and_then(toml::Value::as_str),
+        Some("o3"),
+        "and the rest of the layer survives"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for dst in [&plain_dst, &stripped_dst] {
+            assert_eq!(
+                fs::metadata(dst).expect("stat copy").permissions().mode() & 0o777,
+                0o600,
+                "the mode is not the operator's: {}",
+                dst.display()
+            );
+        }
+    }
+}
+
+/// The shared-flavor home per the codex plan's table: auth.json links the
+/// profile's ONE physical file (dangling until a login exists — that is the
+/// point), the operator surfaces link in, hooks.json only by opt-in, and the
+/// durable stores and rollout roots link into the profile-global home.
+#[cfg(unix)]
+#[test]
+fn a_shared_codex_home_links_the_table() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("skills")).expect("mkdir operator skills");
+    fs::write(operator.join("AGENTS.md"), b"# agents").expect("write agents");
+    fs::write(operator.join("hooks.json"), b"{}").expect("write hooks");
+    fs::write(operator.join("config.toml"), b"model = \"o3\"\n").expect("write config");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let auth = session_home.join("auth.json");
+    assert!(
+        auth.symlink_metadata()
+            .expect("auth link")
+            .file_type()
+            .is_symlink(),
+        "auth.json is a link, never a copy"
+    );
+    assert_eq!(
+        fs::read_link(&auth).expect("read link"),
+        profile.join("auth.json"),
+        "…to the profile's one physical file"
+    );
+    assert!(
+        !auth.exists(),
+        "dangling until a login is captured — by design"
+    );
+
+    assert!(session_home.join("skills").symlink_metadata().is_ok());
+    assert!(session_home.join("AGENTS.md").symlink_metadata().is_ok());
+    assert!(
+        session_home.join("hooks.json").symlink_metadata().is_err(),
+        "hooks execute code: never linked by default"
+    );
+    assert_eq!(
+        fs::read_to_string(session_home.join("config.toml")).expect("read config"),
+        "model = \"o3\"\n",
+        "config.toml is a copy of the operator's (codex writes it in place)"
+    );
+    for entry in [
+        "memories_1.sqlite",
+        "memories_1.sqlite-wal",
+        "thread_history_1.sqlite",
+        "history.jsonl",
+    ] {
+        let link = session_home.join(entry);
+        assert!(
+            link.symlink_metadata()
+                .expect("durable link")
+                .file_type()
+                .is_symlink(),
+            "{entry} links into the profile-global home"
+        );
+        assert_eq!(
+            fs::read_link(&link).expect("read link"),
+            profile.join("codex-home").join(entry)
+        );
+    }
+    for root in ["sessions", "archived_sessions"] {
+        let link = session_home.join(root);
+        assert!(
+            link.symlink_metadata()
+                .expect("rollout root link")
+                .file_type()
+                .is_symlink(),
+            "{root} links into the profile-global home"
+        );
+        let target = profile.join("codex-home").join(root);
+        assert_eq!(fs::read_link(&link).expect("read link"), target);
+        assert!(
+            target.is_dir(),
+            "{root}'s target exists first: codex creates through the link"
+        );
+    }
+
+    // The opt-in flips exactly the hooks link.
+    fs::write(profile.join("config.toml"), b"hooks_json = true\n").expect("write opts");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("rebuild");
+    assert!(
+        session_home.join("hooks.json").symlink_metadata().is_ok(),
+        "the per-profile opt-in links hooks.json"
+    );
+}
+
+/// Isolated links NOTHING from the operator and shares nothing durable — only
+/// the auth.json link (one physical file in both flavors) and the config copy.
+#[cfg(unix)]
+#[test]
+fn an_isolated_codex_home_links_only_the_auth() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("skills")).expect("mkdir operator skills");
+    fs::write(operator.join("AGENTS.md"), b"# agents").expect("write agents");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-isolated-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+
+    build_codex_home(&session_home, "cx", Isolation::Isolated, LinkMode::Real).expect("build");
+
+    assert!(session_home.join("auth.json").symlink_metadata().is_ok());
+    assert!(session_home.join("skills").symlink_metadata().is_err());
+    assert!(session_home.join("AGENTS.md").symlink_metadata().is_err());
+    assert!(
+        session_home
+            .join("memories_1.sqlite")
+            .symlink_metadata()
+            .is_err()
+    );
+    let sessions = session_home.join("sessions");
+    assert!(
+        sessions
+            .symlink_metadata()
+            .expect("sessions")
+            .file_type()
+            .is_dir(),
+        "a real per-session sessions dir, discarded by design"
+    );
+    assert!(
+        session_home
+            .join("archived_sessions")
+            .symlink_metadata()
+            .is_err(),
+        "nothing links into the store from an isolated home"
+    );
+}
+
+/// A rollout is in the store the moment codex writes it, through the link:
+/// codex creates `sessions/<yyyy>/<mm>/<dd>/` under the root, which a link
+/// whose target exists takes, and every later session lists what earlier ones
+/// wrote instead of waiting on a teardown copy that a crash skips.
+#[cfg(unix)]
+#[test]
+fn a_rollout_written_through_the_linked_root_is_in_the_store_before_teardown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let day = session_home.join("sessions/2026/09/16");
+    fs::create_dir_all(&day).expect("codex's dated tree through the link");
+    fs::write(day.join("x.jsonl"), b"{}").expect("write rollout");
+    assert_eq!(
+        fs::read(profile.join("codex-home/sessions/2026/09/16/x.jsonl")).expect("read in store"),
+        b"{}",
+        "visible under the store path with no teardown"
+    );
+
+    // Archiving is codex's rename between the two roots: both link into the
+    // same store dir, so it stays a rename and the thread stays in the store.
+    let archived = session_home.join("archived_sessions/x.jsonl");
+    fs::rename(day.join("x.jsonl"), &archived).expect("archive");
+    assert!(
+        profile
+            .join("codex-home/archived_sessions/x.jsonl")
+            .is_file()
+    );
+}
+
+/// The acquire/teardown lifecycle: a live marker the registry row never
+/// outlives, the codex tag and launch_store on the row, and a teardown that
+/// removes the per-session home while the durable store — the rollout roots
+/// link into it — survives with every rollout the session wrote or archived.
+#[test]
+fn codex_acquire_registers_and_teardown_keeps_the_durable_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let session_home = runtime.home().to_path_buf();
+    assert!(
+        session_home
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_codex_home_dir_name),
+        "the home carries the codex stem: {session_home:?}"
+    );
+    assert!(
+        has_live_session(&crate::profile::ProfileName::from("cx")),
+        "the marker layout makes the shared liveness gates answer for codex"
+    );
+    let rows = crate::live_sessions::list();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].harness, crate::harness::Harness::Codex);
+    assert_eq!(rows[0].start_profile, "cx");
+    assert_eq!(
+        rows[0].launch_store.as_deref(),
+        Some(session_home.join("auth.json").as_path()),
+        "launch_store names the auth.json THIS SESSION READS — under real \
+         symlinks that file IS profiles/<name>/auth.json (the #59 one-liner), \
+         and under fake mode it is the copy the session actually holds"
+    );
+
+    // A rollout the session wrote must survive the session — and so must one
+    // the session ARCHIVED, which codex moves to the sibling rollout root.
+    // Both roots link into the store, so the writes land there directly.
+    let store = profile.join("codex-home");
+    fs::write(session_home.join("sessions").join("rollout-1.jsonl"), b"{}").expect("write rollout");
+    let archived = session_home.join("archived_sessions");
+    fs::create_dir_all(&archived).expect("mkdir archived");
+    fs::write(archived.join("rollout-0.jsonl"), b"{}").expect("write archived rollout");
+    assert!(
+        store.join("sessions").join("rollout-1.jsonl").is_file(),
+        "in the store before any teardown"
+    );
+
+    drop(runtime);
+
+    assert!(!session_home.exists(), "the per-session home is torn down");
+    assert!(
+        store.join("sessions").join("rollout-1.jsonl").is_file(),
+        "the teardown unlinks the root's link, never what it points at"
+    );
+    assert!(
+        store
+            .join("archived_sessions")
+            .join("rollout-0.jsonl")
+            .is_file(),
+        "archiving a thread must not mean deleting it at teardown"
+    );
+    assert!(
+        crate::live_sessions::list().is_empty(),
+        "the row went with it"
+    );
+    assert!(!has_live_session(&crate::profile::ProfileName::from("cx")));
+}
+
+/// Under the fake transport the home collapses to the BARE stem — which is
+/// the durable store itself — and teardown must never remove it.
+#[test]
+fn a_fake_mode_codex_home_is_the_durable_store_and_survives_teardown() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+
+    with_link_mode(LinkMode::Fake, || {
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+        let session_home = runtime.home().to_path_buf();
+        assert_eq!(
+            session_home,
+            profile.join("codex-home"),
+            "fake mode lives in the bare stem"
+        );
+        fs::write(session_home.join("memories_1.sqlite"), b"m").expect("write durable");
+
+        drop(runtime);
+
+        assert!(
+            session_home.join("memories_1.sqlite").exists(),
+            "teardown must never remove the profile's memory because the last session left"
+        );
+    });
+}
+
+/// `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml`, and
+/// CODEX_HOME is the session home — so the operator's profile-v2 files have to
+/// land there too, sanitized like the base config, or the flag silently
+/// resolves to an empty layer. The operator's installed plugins ride the same
+/// link set as skills and rules, so an install outlives the session.
+#[cfg(unix)]
+#[test]
+fn a_session_home_carries_the_profile_layers_and_the_plugin_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let operator = home.home().join(".codex");
+    fs::create_dir_all(operator.join("plugins/cache")).expect("mkdir plugins");
+    fs::write(operator.join("config.toml"), b"model = \"o3\"\n").expect("write config");
+    fs::write(
+        operator.join("work.config.toml"),
+        b"model = \"gpt-5\"\nsqlite_home = \"/tmp/shared\"\n",
+    )
+    .expect("write profile layer");
+
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let session_home = profile.join("codex-home-4242-0");
+    crate::profile::mkdir_700(&session_home).expect("mkdir home");
+    build_codex_home(&session_home, "cx", Isolation::Shared, LinkMode::Real).expect("build");
+
+    let layer = fs::read_to_string(session_home.join("work.config.toml")).expect("read layer");
+    let parsed: toml::Value = toml::from_str(&layer).expect("valid TOML");
+    assert_eq!(
+        parsed.get("model").and_then(toml::Value::as_str),
+        Some("gpt-5"),
+        "the profile layer reached the home `--profile` looks in"
+    );
+    assert!(
+        parsed.get("sqlite_home").is_none(),
+        "and a layer cannot spell the escape the base config just lost: {layer}"
+    );
+    assert!(
+        session_home.join("plugins").symlink_metadata().is_ok(),
+        "installed plugins are linked like skills and rules"
+    );
+}
+
+/// codex heals a corrupt state DB by RENAMING the path it was handed into
+/// `db-backups/` and writing a fresh one in its place — and the path it was
+/// handed is our symlink, so the rename moves the LINK and the corrupt bytes
+/// stay in the store. Without a sync-back the healed DB dies with the session
+/// and every later one relinks to the same corruption, forever.
+#[cfg(unix)]
+#[test]
+fn a_db_codex_healed_in_place_reaches_the_durable_store() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let store = profile.join("codex-home");
+    fs::create_dir_all(&store).expect("mkdir store");
+    fs::write(store.join("state_5.sqlite"), b"corrupt").expect("seed corrupt db");
+
+    let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("acquire");
+    let session_home = runtime.home().to_path_buf();
+    let healed = session_home.join("state_5.sqlite");
+    assert!(
+        healed
+            .symlink_metadata()
+            .expect("placed")
+            .file_type()
+            .is_symlink(),
+        "the build places a link"
+    );
+    // codex's recovery: the LINK is renamed away, a fresh REAL file takes its
+    // name. The store still holds the corrupt bytes at this point.
+    let backups = session_home.join("db-backups");
+    fs::create_dir_all(&backups).expect("mkdir backups");
+    fs::rename(&healed, backups.join("state_5.sqlite")).expect("rename the link away");
+    fs::write(&healed, b"healed").expect("codex writes a fresh db");
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read store"),
+        b"corrupt",
+        "the store is untouched by codex's rename — that is the whole problem"
+    );
+
+    drop(runtime);
+
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read store"),
+        b"healed",
+        "teardown carries the healed DB back, so the next session stops relinking to corruption"
+    );
+}
+
+/// The recovery sync-back must carry back ONLY what codex replaced. An
+/// untouched durable entry is still a link into the store, and copying it back
+/// would rewrite the store file through its own link — same bytes, NEW inode,
+/// swapped out from under any concurrent session that has that sqlite open
+/// through its own link. Teardown of one session must not do that to another.
+#[cfg(unix)]
+#[test]
+fn teardown_leaves_an_untouched_durable_entry_on_its_own_inode() {
+    use std::os::unix::fs::MetadataExt;
+
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let store = profile.join("codex-home");
+    fs::create_dir_all(&store).expect("mkdir store");
+    fs::write(store.join("state_5.sqlite"), b"live").expect("seed db");
+    let before = fs::metadata(store.join("state_5.sqlite"))
+        .expect("stat")
+        .ino();
+
+    let first = CodexRuntime::acquire("cx", Isolation::Shared).expect("first");
+    let second = CodexRuntime::acquire("cx", Isolation::Shared).expect("second");
+    drop(first);
+
+    assert_eq!(
+        fs::metadata(store.join("state_5.sqlite"))
+            .expect("stat")
+            .ino(),
+        before,
+        "the second session still holds this inode open — teardown may not replace it"
+    );
+    assert_eq!(
+        fs::read(store.join("state_5.sqlite")).expect("read"),
+        b"live"
+    );
+    drop(second);
+}
+
+/// Decision 8 lets codex sessions run concurrently BECAUSE they share one
+/// physical auth.json. Under the fake transport they do not: the two flavors
+/// collapse to separate bare homes, each holding its own copy converged from
+/// the same store, so two live flavors are two carriers of one single-use
+/// chain. The acquire refuses instead of minting the permanent-death setup.
+#[test]
+fn fake_mode_refuses_the_second_flavor_of_one_profile() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        let shared = CodexRuntime::acquire("cx", Isolation::Shared).expect("shared acquire");
+        let msg = match CodexRuntime::acquire("cx", Isolation::Isolated) {
+            Ok(_) => panic!("the second flavor would be a second carrier"),
+            Err(e) => e.to_string(),
+        };
+        assert!(
+            msg.contains("SEPARATE copies of one single-use chain"),
+            "the refusal names why: {msg}"
+        );
+        // Same flavor is still fine — that IS one home.
+        let second =
+            CodexRuntime::acquire("cx", Isolation::Shared).expect("same flavor is one home");
+        drop(second);
+        drop(shared);
+        // With nothing live, the other flavor is free again.
+        drop(CodexRuntime::acquire("cx", Isolation::Isolated).expect("free once the first ends"));
+    });
+}
+
+/// A crash leaves the fake-mode ISOLATED home holding the only copy of a
+/// rotated chain — no Drop ran, so nothing converged it back to the store. The
+/// next acquire must not wipe that home: its name is sid-free like every fake
+/// name, so a guard testing only the SHARED bare stem read it as a recycled
+/// per-session tree and deleted the live refresh token, after which the build
+/// converged the store's SPENT token outward for codex to replay.
+#[test]
+fn a_crashed_fake_isolated_home_keeps_the_only_rotated_chain() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"spent\":true}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        let session_home = {
+            let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("acquire");
+            let home = runtime.home().to_path_buf();
+            assert_eq!(
+                home,
+                profile.join("codex-home-isolated"),
+                "fake mode collapses the isolated home to its own bare stem"
+            );
+            // The session rotates the copy, then the process dies: forget the
+            // runtime instead of dropping it, so no teardown converge runs.
+            fs::write(home.join("auth.json"), b"{\"rotated\":true}").expect("rotate the copy");
+            std::mem::forget(runtime);
+            home
+        };
+        // The marker the dead session left behind reads as zero active.
+        let _ = fs::remove_dir_all(profile.join("sessions-isolated"));
+
+        let runtime = CodexRuntime::acquire("cx", Isolation::Isolated).expect("re-acquire");
+        assert_eq!(
+            fs::read(session_home.join("auth.json")).expect("read copy"),
+            b"{\"rotated\":true}",
+            "the only carrier of the rotated chain survived the re-acquire"
+        );
+        drop(runtime);
+        assert_eq!(
+            fs::read(profile.join("auth.json")).expect("read store"),
+            b"{\"rotated\":true}",
+            "and reached the store, instead of the spent token being replayed"
+        );
+    });
+}
+
+/// Under Fake the auth copy is a PROJECTION of the store: a re-capture
+/// reaches the NEXT session because the build re-converges the copy at every
+/// acquire, instead of copying once and never again.
+#[test]
+fn a_fake_mode_codex_home_reconverges_the_auth_projection() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    fs::write(profile.join("auth.json"), b"{\"v\":1}").expect("seed store");
+
+    with_link_mode(LinkMode::Fake, || {
+        drop(CodexRuntime::acquire("cx", Isolation::Shared).expect("first acquire"));
+        // A re-capture replaced the store between sessions (newer mtime).
+        fs::write(profile.join("auth.json"), b"{\"v\":2}").expect("replace store");
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("second acquire");
+        let copy = runtime.home().join("auth.json");
+        assert_eq!(
+            fs::read(&copy).expect("read copy"),
+            b"{\"v\":2}",
+            "a newer store wins the converge at session start"
+        );
+
+        // The session ROTATES the copy — the fresh chain must reach the
+        // store at teardown, not sit in a copy the next converge overwrites
+        // with the store's spent token (the permanent-death direction).
+        fs::write(&copy, b"{\"v\":3}").expect("rotate the copy");
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+        crate::testutil::set_mtime(&copy, later);
+        drop(runtime);
+        assert_eq!(
+            fs::read(profile.join("auth.json")).expect("read store"),
+            b"{\"v\":3}",
+            "a chain rotated in the copy reaches the store at teardown"
+        );
+    });
+}
+
+/// Each boundary hands a full tie (stampless bodies, equal mtimes) to its OWN
+/// prior, pinned through `acquire` and `Drop` rather than the fn: the build
+/// sends it the store's way, the teardown the copy's. Either site naming the
+/// other's prior would ship the permanent-death direction at that boundary.
+#[test]
+fn the_fake_mode_boundaries_break_a_full_tie_by_their_own_prior() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+    fs::create_dir_all(&profile).expect("mkdir profile");
+    let store = profile.join("auth.json");
+    fs::write(&store, b"{\"v\":1}").expect("seed store");
+    let same = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+    with_link_mode(LinkMode::Fake, || {
+        let copy = CodexRuntime::acquire("cx", Isolation::Shared)
+            .expect("first acquire")
+            .home()
+            .join("auth.json");
+
+        fs::write(&store, b"{\"side\":\"store\"}").expect("write store");
+        fs::write(&copy, b"{\"side\":\"copy\"}").expect("write copy");
+        crate::testutil::set_mtime(&store, same);
+        crate::testutil::set_mtime(&copy, same);
+        let runtime = CodexRuntime::acquire("cx", Isolation::Shared).expect("second acquire");
+        assert_eq!(
+            fs::read(&copy).expect("read copy"),
+            b"{\"side\":\"store\"}",
+            "build: the store wins a full tie through acquire"
+        );
+
+        fs::write(&store, b"{\"side\":\"store2\"}").expect("write store");
+        fs::write(&copy, b"{\"side\":\"copy2\"}").expect("write copy");
+        crate::testutil::set_mtime(&store, same);
+        crate::testutil::set_mtime(&copy, same);
+        drop(runtime);
+        assert_eq!(
+            fs::read(&store).expect("read store"),
+            b"{\"side\":\"copy2\"}",
+            "teardown: the copy wins a full tie through Drop"
+        );
+    });
+}
+
+/// An `auth.json` body carrying a `last_refresh` stamp and a marker that tells
+/// the two sides apart.
+fn stamped_auth(last_refresh: &str, marker: &str) -> String {
+    format!(
+        "{{\"tokens\":{{\"access_token\":\"at\",\"refresh_token\":\"{marker}\"}},\
+         \"last_refresh\":\"{last_refresh}\"}}"
+    )
+}
+
+/// The fake-mode convergence decides by the chain's own event first: the
+/// later `last_refresh` wins in EITHER direction, whatever the mtimes say,
+/// since a filesystem's mtime is not what stamped the rotation.
+#[test]
+fn fake_convergence_takes_the_later_last_refresh_over_the_newer_mtime() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store.json");
+    let copy = tmp.path().join("copy.json");
+    let older = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    let newer = older + std::time::Duration::from_secs(600);
+
+    // The copy rotated later but carries the OLDER mtime.
+    fs::write(&store, stamped_auth("2026-09-16T10:00:00Z", "rt.store")).expect("write store");
+    fs::write(&copy, stamped_auth("2026-09-16T11:00:00Z", "rt.copy")).expect("write copy");
+    crate::testutil::set_mtime(&store, newer);
+    crate::testutil::set_mtime(&copy, older);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Build).expect("converge");
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        stamped_auth("2026-09-16T11:00:00Z", "rt.copy").as_bytes(),
+        "the copy's later rotation reaches the store past its older mtime"
+    );
+
+    // And the other way round: the store rotated later, the copy is the
+    // newer file on disk.
+    fs::write(&store, stamped_auth("2026-09-16T12:00:00Z", "rt.store2")).expect("write store");
+    fs::write(&copy, stamped_auth("2026-09-16T11:30:00Z", "rt.copy2")).expect("write copy");
+    crate::testutil::set_mtime(&store, older);
+    crate::testutil::set_mtime(&copy, newer);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Teardown).expect("converge");
+    assert_eq!(
+        fs::read(&copy).expect("read copy"),
+        stamped_auth("2026-09-16T12:00:00Z", "rt.store2").as_bytes(),
+        "the store's later rotation reaches the copy past the teardown prior"
+    );
+}
+
+/// With no stamp to read and equal mtimes (a coarse-mtime filesystem), the
+/// boundary's own prior decides: at teardown the session was the only live
+/// writer, so the copy wins; at build only the store is written between
+/// sessions, so the store wins. A tie sent the wrong way hands a spent token
+/// back to the side that rotated.
+#[test]
+fn fake_convergence_breaks_a_full_tie_by_the_boundarys_prior() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let store = tmp.path().join("store.json");
+    let copy = tmp.path().join("copy.json");
+    let same = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+
+    fs::write(&store, b"{\"side\":\"store\"}").expect("write store");
+    fs::write(&copy, b"{\"side\":\"copy\"}").expect("write copy");
+    crate::testutil::set_mtime(&store, same);
+    crate::testutil::set_mtime(&copy, same);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Teardown).expect("converge");
+    assert_eq!(
+        fs::read(&store).expect("read store"),
+        b"{\"side\":\"copy\"}",
+        "teardown: the session alone could have written, so the copy wins"
+    );
+
+    fs::write(&store, b"{\"side\":\"store\"}").expect("write store");
+    fs::write(&copy, b"{\"side\":\"copy\"}").expect("write copy");
+    crate::testutil::set_mtime(&store, same);
+    crate::testutil::set_mtime(&copy, same);
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Build).expect("converge");
+    assert_eq!(
+        fs::read(&copy).expect("read copy"),
+        b"{\"side\":\"store\"}",
+        "build: between sessions only the store is written, so the store wins"
+    );
+
+    // Content-equal is a no-op before any of it: neither file is rewritten.
+    fs::write(&store, b"{\"same\":true}").expect("write store");
+    fs::write(&copy, b"{\"same\":true}").expect("write copy");
+    crate::testutil::set_mtime(&store, same);
+    crate::testutil::set_mtime(&copy, same + std::time::Duration::from_secs(1));
+    converge_fake_codex_auth(&store, &copy, ConvergePrior::Teardown).expect("converge");
+    assert_eq!(
+        fs::metadata(&store)
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        same
+    );
+    assert_eq!(
+        fs::metadata(&copy)
+            .expect("stat")
+            .modified()
+            .expect("mtime"),
+        same + std::time::Duration::from_secs(1),
+        "matching bytes short-circuit before any copy"
+    );
+}
+
+/// A crashed session's per-session home is collected once its marker reads
+/// dead — and the bare durable store is never touched, whatever GC runs.
+#[test]
+fn gc_collects_a_dead_codex_home_and_spares_the_live_and_the_bare() {
+    let home = crate::testutil::HomeSandbox::new();
+    let profile = home.home().join(".clauth/profiles/cx");
+
+    // A crash's leftover: home with a dead (empty) marker dir.
+    let dead_home = profile.join("codex-home-4242-0");
+    fs::create_dir_all(&dead_home).expect("mkdir dead home");
+    fs::create_dir_all(profile.join("sessions-4242-0")).expect("mkdir dead marker");
+    // One with NO marker dir at all (teardown died between removals).
+    let orphan_home = profile.join("codex-home-isolated-4243-0");
+    fs::create_dir_all(&orphan_home).expect("mkdir orphan home");
+    // A LIVE one: locked pid in its marker dir.
+    let live_home = profile.join("codex-home-4244-0");
+    fs::create_dir_all(&live_home).expect("mkdir live home");
+    let live_marker = profile.join("sessions-4244-0");
+    fs::create_dir_all(&live_marker).expect("mkdir live marker");
+    let pid = open_pid_file(&live_marker.join("4244-0")).expect("open pid");
+    pid.lock().expect("lock pid");
+    // The durable store, and a name that only LOOKS per-session.
+    let bare = profile.join("codex-home");
+    fs::create_dir_all(&bare).expect("mkdir bare store");
+    let lookalike = profile.join("codex-home-notasid");
+    fs::create_dir_all(&lookalike).expect("mkdir lookalike");
+
+    gc_stale_runtimes();
+
+    assert!(!dead_home.exists(), "a dead session's home is collected");
+    assert!(
+        !orphan_home.exists(),
+        "a markerless home is a crash leftover, collected"
+    );
+    assert!(live_home.exists(), "a live session's home is spared");
+    assert!(bare.exists(), "the durable store is never GC territory");
+    assert!(
+        lookalike.exists(),
+        "a non-sid suffix is not a per-session home"
+    );
 }
 
 /// A live session's liveness marker: an open file holding the same exclusive
@@ -8577,6 +10056,251 @@ fn gc_finishes_a_stranded_rescue_tombstone() {
     assert!(!tombstone.exists(), "the tombstone must be collected");
 }
 
+#[test]
+fn namespaced_keychain_owner_records_service_profile_session_owner_only() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join(".clauth/profiles/ledgered/runtime-700-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("ledgered");
+    let session = SessionId::for_test("700-1");
+    let derived = crate::claude::namespaced_keychain_service(
+        &runtime.canonicalize().expect("canonical runtime"),
+    );
+    let persisted = std::cell::Cell::new(false);
+    let owned =
+        namespaced_keychain_ledger::authorize_write_with(&runtime, &profile, &session, |owners| {
+            persisted.set(true);
+            namespaced_keychain_ledger::save(owners)
+        })
+        .expect("persist owner before write");
+
+    assert!(
+        persisted.get(),
+        "the persist leg ran before the witness minted"
+    );
+    assert_eq!(
+        owned.service(),
+        derived,
+        "the witness names the service the durable row authorizes"
+    );
+    let owners = namespaced_keychain_ledger::load().expect("read ledger");
+    assert_eq!(
+        owners.owners,
+        vec![namespaced_keychain_ledger::Owner {
+            service: owned.service().to_string(),
+            profile,
+            session: "700-1".to_string(),
+        }],
+        "the durable row carries the semantic service/profile/session owner"
+    );
+    assert_eq!(
+        namespaced_keychain_ledger::owned_services().expect("owned services"),
+        BTreeSet::from([owned.service().to_string()]),
+        "the census view is derived from the durable owner rows"
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let path = namespaced_keychain_ledger::path().expect("ledger path");
+        let mode = fs::metadata(&path)
+            .expect("ledger metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the ledger is born owner-only");
+        let dir_mode = fs::metadata(path.parent().expect("ledger parent"))
+            .expect("parent metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700, "the ledger parent is owner-only");
+    }
+}
+
+#[test]
+fn failed_owner_persist_prevents_the_namespaced_item_write_decision() {
+    let home = HomeSandbox::new();
+    let runtime = home.home().join("runtime-701-1");
+    fs::create_dir_all(&runtime).expect("runtime dir");
+    let profile = crate::profile::ProfileName::from("blocked");
+    let session = SessionId::for_test("701-1");
+
+    let result =
+        namespaced_keychain_ledger::authorize_write_with(&runtime, &profile, &session, |_| {
+            anyhow::bail!("posed ledger persist failure")
+        });
+
+    assert!(
+        result.is_err(),
+        "the ledger failure is returned — no write witness exists to reach a Keychain sink"
+    );
+    assert!(
+        namespaced_keychain_ledger::load()
+            .expect("read ledger")
+            .owners
+            .is_empty(),
+        "the failed persist strands no ownership row"
+    );
+}
+
+/// The ownership-first wiring, structurally: every namespaced producer routes
+/// through `authorize_write`, whose [`OwnedKeychainWrite`] witness is the only
+/// argument the macOS Keychain sinks accept, so a `/usr/bin/security` write
+/// cannot run without a durable row behind it (the type enforces it on the
+/// macOS build). The producer blocks and sink signatures are macOS-only code no
+/// Linux run compiles, so the pin is a source scan, the same mechanism the
+/// `run_delegate` wiring pins use.
+#[test]
+fn the_namespaced_keychain_sinks_require_a_durable_ownership_witness() {
+    let runtime_src = include_str!("../../src/runtime.rs");
+    assert_eq!(
+        runtime_src
+            .matches("namespaced_keychain_ledger::authorize_write(")
+            .count(),
+        6,
+        "every namespaced producer (swap install + sign-out, start sign-out + install, \
+         watchdog retry, convergence sign-out) takes the ownership-first path"
+    );
+
+    let keychain_src = include_str!("../../src/keychain.rs");
+    for sink in [
+        "pub(crate) fn keychain_install_for_config_dir(",
+        "pub(crate) fn keychain_sign_out_for_config_dir(",
+    ] {
+        let signature = keychain_src
+            .split_once(sink)
+            .expect("the sink is defined")
+            .1
+            .split_once('{')
+            .expect("the sink body opens")
+            .0;
+        assert!(
+            signature.contains("OwnedKeychainWrite"),
+            "the {sink} sink accepts only the durable-ownership witness, never a raw service \
+             string: {signature}"
+        );
+    }
+
+    let claude_src = include_str!("../../src/claude.rs");
+    let signature = claude_src
+        .split_once("pub(crate) fn keychain_mirror_source_for_config_dir(")
+        .expect("the mirror source is defined")
+        .1
+        .split_once('{')
+        .expect("the mirror body opens")
+        .0;
+    assert!(
+        signature.contains("OwnedKeychainWrite"),
+        "the mirror source accepts only the durable-ownership witness: {signature}"
+    );
+}
+
+/// The walk-derived collector takes the same salvage path the census does:
+/// readable bytes are quarantined before its delete, and no direct delete
+/// survives beside it. The collector is macOS-only code no Linux run compiles,
+/// so the pin is a source scan.
+#[test]
+fn the_stale_runtime_collector_takes_the_salvage_path() {
+    let runtime_src = include_str!("../../src/runtime.rs");
+    let collector = runtime_src
+        .split_once("fn collect_orphaned_keychain_item(")
+        .expect("the collector is defined")
+        .1
+        .split_once("pub(crate) fn shared_runtime_dirs")
+        .expect("the collector body ends where the shared-dirs walk begins")
+        .0;
+    assert!(
+        collector.contains("crate::keychain::salvage_delete_namespaced_item(service)"),
+        "the walk-derived collector salvages readable bytes before its delete: {collector}"
+    );
+    assert!(
+        !collector.contains("delete_at("),
+        "no direct delete survives beside the salvage path: {collector}"
+    );
+}
+
+#[test]
+fn retiring_a_namespaced_keychain_owner_removes_later_delete_authority() {
+    let _home = HomeSandbox::new();
+    let service = "Claude Code-credentials-deadbeef";
+    let profile = crate::profile::ProfileName::from("retired");
+    let session = SessionId::for_test("702-1");
+    namespaced_keychain_ledger::record_with(
+        service,
+        &profile,
+        &session,
+        namespaced_keychain_ledger::save,
+    )
+    .expect("record owner");
+
+    namespaced_keychain_ledger::retire(service).expect("retire owner");
+
+    assert!(
+        namespaced_keychain_ledger::owned_services()
+            .expect("owned services")
+            .is_empty(),
+        "a reused service has no delete authority after its row retires"
+    );
+}
+
+#[test]
+fn the_namespaced_keychain_ledger_rejects_malformed_owner_rows() {
+    let _home = HomeSandbox::new();
+    let path = namespaced_keychain_ledger::path().expect("ledger path");
+    fs::create_dir_all(path.parent().expect("ledger parent")).expect("clauth dir");
+    let write = |body: &str| fs::write(&path, body).expect("fixture ledger");
+
+    write(r#"{"owners":[{"service":"not-a-namespaced-service","profile":"p","session":"1-1"}]}"#);
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a service the naming rule could not produce must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"bad/name","session":"1-1"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a profile name the charset gate refuses must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"p","session":"not-a-sid"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "a session id outside the minted shape must reject the whole ledger"
+    );
+
+    write(
+        r#"{"owners":[{"service":"Claude Code-credentials-deadbeef","profile":"p","session":"1-1"},{"service":"Claude Code-credentials-cafebabe","profile":"q","session":"broken"}]}"#,
+    );
+    assert!(
+        namespaced_keychain_ledger::owned_services().is_err(),
+        "one malformed row among good ones fails the whole ledger closed"
+    );
+}
+
+#[test]
+fn a_ledger_row_outlives_its_profile_and_stays_authoritative() {
+    let _home = HomeSandbox::new();
+    namespaced_keychain_ledger::record_with(
+        "Claude Code-credentials-deadbeef",
+        &crate::profile::ProfileName::from("gone"),
+        &SessionId::for_test("703-1"),
+        namespaced_keychain_ledger::save,
+    )
+    .expect("record owner");
+
+    assert_eq!(
+        namespaced_keychain_ledger::owned_services().expect("owned services"),
+        BTreeSet::from(["Claude Code-credentials-deadbeef".to_string()]),
+        "a row whose profile was deleted stays authoritative — profile-deletion orphans \
+         are exactly the census's stranding-input class"
+    );
+}
+
 /// The arm selection for the macOS session-start Keychain seed — pure, so
 /// the absent→sign-out / refreshless→skip / else→carry decision is pinned on
 /// every platform while the seeding itself only a Mac exercises. The
@@ -8645,4 +10369,28 @@ fn swap_item_arm_selection() {
     assert_eq!(swap_item_arm(Some(&store(Some("r")))), SwapItemArm::Install);
     // An unparseable read proceeds, not signs out.
     assert_eq!(swap_item_arm(None), SwapItemArm::Install);
+}
+
+/// The seed's failure disposition — pure, so the retry decision is pinned on
+/// every platform while the seed and its watchdog-tick retry only a Mac
+/// exercises. A locked keychain (the classified exit 36) is the one failure
+/// that arms the retry: it clears the moment the keychain unlocks, and the
+/// next credential tick re-runs the seed's carry-then-write. Everything else
+/// keeps the pre-fix loud degrade — exit 51 and the unclassified codes
+/// included, since nothing measures them transient.
+#[test]
+fn seed_degrade_disposition_retries_only_the_classified_transient() {
+    use crate::claude::SecurityExitClass;
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::InteractionNotAllowed),
+        SeedDegradeDisposition::RetryOnTick
+    );
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::ItemNotFound),
+        SeedDegradeDisposition::LogAndDegrade
+    );
+    assert_eq!(
+        seed_degrade_disposition(SecurityExitClass::Unclassified),
+        SeedDegradeDisposition::LogAndDegrade
+    );
 }

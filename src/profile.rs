@@ -712,6 +712,17 @@ impl Default for HerdrSettings {
     }
 }
 
+/// The daemon's session-creation knob, persisted under `[serve]` in
+/// profiles.toml. Like [`HerdrSettings`], the table may be absent (defaults) or
+/// partial: a missing field fills from [`Default`] rather than erroring.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(crate) struct ServeSettings {
+    /// The daemon-wide switch: whether `POST /api/v1/sessions` is served at all
+    /// (default off). Each calling device also needs its own `sessions` grant.
+    pub(crate) session_creation: bool,
+}
+
 /// Stored at ~/.clauth/profiles.toml — ordering and active marker only.
 /// Credentials and endpoint config live in per-profile subdirectories.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -884,10 +895,19 @@ pub(crate) struct AppState {
     /// profiles.toml gains no `[herdr]` block on the next save.
     #[serde(default, skip_serializing_if = "herdr_is_default")]
     pub(crate) herdr: HerdrSettings,
+    /// The daemon's `[serve]` table. Omitted from the file while at its
+    /// default, so an untouched profiles.toml gains no `[serve]` block on the
+    /// next save.
+    #[serde(default, skip_serializing_if = "serve_is_default")]
+    pub(crate) serve: ServeSettings,
 }
 
 fn herdr_is_default(herdr: &HerdrSettings) -> bool {
     *herdr == HerdrSettings::default()
+}
+
+fn serve_is_default(serve: &ServeSettings) -> bool {
+    *serve == ServeSettings::default()
 }
 
 impl AppState {
@@ -1079,6 +1099,7 @@ impl Default for AppState {
             burn_switch_floor_pct: None,
             burn_horizon_cap_ms: None,
             herdr: HerdrSettings::default(),
+            serve: ServeSettings::default(),
         }
     }
 }
@@ -1472,6 +1493,11 @@ pub(crate) fn app_state_mtime() -> Option<SystemTime> {
 #[derive(Clone, PartialEq, Eq, Debug, Hash)]
 pub(crate) struct ReloadFingerprint {
     profiles_toml_mtime: Option<SystemTime>,
+    /// `codex-profiles.toml`'s mtime — a codex switch or chain edit writes that
+    /// file and nothing else, so without this stat a codex state change would
+    /// never shift the fingerprint. The dir walk below already covers a codex
+    /// profile's `config.toml`; this is the only codex-specific stat needed.
+    codex_toml_mtime: Option<SystemTime>,
     /// `(profile dir name, config.toml mtime, session-token.json write time)`,
     /// each `None` when the file is absent, sorted by name so readdir order can't
     /// spuriously flip equality. The sidecar rides here because a
@@ -1520,6 +1546,7 @@ pub(crate) fn reload_fingerprint() -> ReloadFingerprint {
     config_mtimes.sort();
     ReloadFingerprint {
         profiles_toml_mtime,
+        codex_toml_mtime: crate::codex_profiles::codex_state_mtime(),
         config_mtimes,
     }
 }
@@ -2035,6 +2062,15 @@ pub(crate) fn enforce_clauth_perms(root: &Path) {
         if meta.permissions().mode() & 0o777 != want {
             let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(want));
         }
+        // A codex home's CONTENTS are codex's own: the PATH-alias helper
+        // binaries codex plants there carry exec bits a blanket 0600 would
+        // strip. The home node itself keeps the 0700 invariant (just applied
+        // above); the walk stops at its threshold rather than skipping the
+        // node, and `auth.json`'s writer owns that file's 0600 itself instead
+        // of relying on this sweep to retighten it.
+        if is_dir && crate::runtime::is_codex_home_path(root) {
+            return;
+        }
         if is_dir && let Ok(entries) = std::fs::read_dir(root) {
             for entry in entries.flatten() {
                 enforce_clauth_perms(&entry.path());
@@ -2098,6 +2134,14 @@ pub(crate) fn active_profile_name() -> Option<ProfileName> {
 /// boundary, not an oversight.
 pub(crate) fn is_configured(name: &ProfileName) -> Result<bool> {
     Ok(load_app_state()?.profiles.iter().any(|n| n == name))
+}
+
+/// The claude roster, read from `profiles.toml` alone — the name list without
+/// the per-profile config/credential reads `load_config` does. For the
+/// cross-harness name-uniqueness check, which needs both rosters from disk and
+/// neither's profiles.
+pub(crate) fn claude_roster_names() -> Result<Vec<ProfileName>> {
+    Ok(load_app_state()?.profiles)
 }
 
 pub(crate) fn load_app_state() -> Result<AppState> {

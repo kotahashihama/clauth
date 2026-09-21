@@ -561,10 +561,11 @@ pub(crate) fn instructions_block(
 ) -> String {
     let mut out = String::new();
     out.push_str(
-        "clauth manages multiple Claude Code accounts (\"profiles\"): each an isolated \
-credential set / subscription. Use its tools to compare usage headroom across accounts, relink \
-the active account, or delegate a task to another account without spending this session's \
-window.\n\n",
+        "clauth manages multiple accounts (\"profiles\"): each an isolated credential set / \
+subscription. Use its tools to compare usage headroom across accounts, relink the active \
+account, or delegate a task to another account without spending this session's window. These \
+tools see CLAUDE CODE accounts only — clauth also manages codex accounts, which are invisible \
+here and switch through its CLI.\n\n",
     );
     if let Some(line) = identity_line(profiles, auth) {
         out.push_str(&line);
@@ -751,11 +752,13 @@ fn jobs_listing_prose(p: &Value) -> String {
         if state == "blocking" {
             out.push_str(" (its own caller takes the result)");
         }
-        // The orphaned row is the one where the session id is the only handle
-        // left: the server that wrote the record is gone. On a running row it
-        // would invite resuming a session the live run still holds, so it stays
-        // unsaid there — the JSON row still carries the key either way.
-        if state == "orphaned"
+        // The resume sentence is what makes the pair-loop possible from the
+        // listing alone: a session id whose run is over is a handle. Rendered
+        // for an orphaned row (the only handle left) and a done one (the
+        // completion's own id, stamped by every completion arm). On a running
+        // row it would invite resuming a session the live run still holds, so
+        // it stays unsaid there — the JSON row still carries the key either way.
+        if matches!(state, "orphaned" | "done")
             && let Some(sid) = row.get("session_id").and_then(Value::as_str)
         {
             out.push_str(&format!("; resume with session id `{sid}`"));

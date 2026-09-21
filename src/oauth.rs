@@ -343,6 +343,13 @@ static AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
         .into()
 });
 
+/// The shared HTTP agent — one connect/recv budget and one
+/// status-as-value policy for every clauth-side token call, the codex
+/// refresh included.
+pub(crate) fn http_agent() -> &'static ureq::Agent {
+    &AGENT
+}
+
 /// A token-refresh failure, split so the AUTH-1 gate can tell a *permanently*
 /// revoked/invalid refresh token (quarantine the account — `clauth login` is the
 /// only fix) from a *transient* network/429/5xx blip (refuse this one switch,
@@ -2340,8 +2347,10 @@ fn rolling_install_gate(
         RollAttempt::ChainStale => {}
     }
     // A live session launched on the ROTATING PAIR — it started before any
-    // sidecar existed, so `install_source_path` handed it credentials.json and
-    // spending the refresh here revokes the chain under it. Asked through
+    // sidecar existed, so `install_source_path` handed it credentials.json.
+    // Its own swap poll converges it onto the sidecar in place; until that
+    // lands, spending the refresh here would fail that session's next refresh
+    // (`invalid_grant`) and can blank its own Keychain item. Asked through
     // `rotation_blocked_for` rather than re-derived, so this leg inherits the
     // one place that decision lives (and, with it, the fact that the whole
     // refusal is macOS-only: elsewhere the session reads the very file a

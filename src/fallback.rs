@@ -942,6 +942,21 @@ pub(crate) struct ChainSnapshot {
     /// even with idle-looking usage, so it is walked around like `broken`, and
     /// a rejected ACTIVE bypasses the exhaustion gate the same way.
     pub(crate) kick_rejected: Vec<ProfileName>,
+    /// Members whose usage-reading channel is DEAD: deep-slot stuck
+    /// `RateLimited` (the streak that already opens the scan bypass
+    /// `reading_is_actionable`) with a windowless or absent store entry, so
+    /// the live window this walk's exhaustion gate needs as evidence can
+    /// never arrive (issue #83: a persistent `/usage` 429 writes no windows).
+    /// Not config state — [`snapshot_chain`] leaves it empty and the
+    /// scheduler's scans fill it from the status/streak/store triple (like
+    /// `kick_rejected`). A dead-reading ACTIVE bypasses the exhaustion gate
+    /// like `broken`/`kick_rejected`/`canceled` — windowless reads as
+    /// never-exhausted, which would hold the walk on the member forever.
+    /// Deliberately NOT a member holding any window at all: a lapsed or
+    /// headroom window is a trustworthy last read the existing rules already
+    /// judge (RLS-1). The codex twin stays empty — its usage leg is passive
+    /// polling with no stuck-RateLimited concept.
+    pub(crate) reading_dead: Vec<ProfileName>,
     /// Members whose last store read was live (`FetchStatus::Fresh`) — the same
     /// freshness `decision_fresh` gates the ACTIVE on. Not config state:
     /// [`snapshot_chain`] leaves it empty and the scheduler's scan fills it from
@@ -960,6 +975,75 @@ pub(crate) struct ChainSnapshot {
 pub(crate) fn snapshot_chain(config: &AppConfig) -> Option<ChainSnapshot> {
     let active = config.state.active_profile.as_ref().cloned()?;
     snapshot_chain_from(config, &active)
+}
+
+/// [`snapshot_chain`]'s codex twin, built from `codex-profiles.toml` instead of
+/// `AppConfig`. Chains are strictly per-harness (decision 4), so this reads the
+/// codex active slot, the codex chain, and the codex wrap-off — and nothing
+/// from the claude state.
+///
+/// Every member takes the DEFAULTS a claude member would inherit from a missing
+/// `Profile` record, because a codex profile has none: `profiles.toml` is
+/// untouched by the file split, so `config.find` cannot answer for these names
+/// and the per-profile knobs (last_resort, preferred, max_spend, per-member
+/// thresholds) simply do not exist on this harness yet.
+///
+/// `check_scoped` is DISARMED for every codex member, per the delivery spec:
+/// per-model weekly windows are a claude concept (`"7d fable"` and friends come
+/// from the anthropic `limits[]` array), and `wham/usage` has no equivalent. An
+/// armed gate would judge codex members against windows that can never appear.
+///
+/// `broken` and `kick_rejected` are filled HERE, where the claude builder
+/// leaves the second to the scheduler's scan: the codex verdicts live beside
+/// each store (`codex_auth::read_quarantine`) and in the kick map, not in any
+/// scheduler store, so this is the one place that can read them.
+pub(crate) fn snapshot_codex_chain(
+    state: &crate::codex_profiles::CodexState,
+    interval_ms: u64,
+) -> Option<ChainSnapshot> {
+    let active = state.active_profile()?.clone();
+    let chain: Vec<ProfileName> = state.fallback_chain().to_vec();
+    if !chain.iter().any(|n| n == &active) {
+        return None;
+    }
+    let weekly_pct = state.weekly_switch_threshold_pct();
+    let broken = chain
+        .iter()
+        .filter(|name| crate::codex_auth::read_quarantine(name.as_str()).is_some())
+        .cloned()
+        .collect();
+    let kick_rejected = chain
+        .iter()
+        .filter(|name| crate::codex_auth::kick_breaker_tripped(name.as_str()))
+        .cloned()
+        .collect();
+    Some(ChainSnapshot {
+        active,
+        chain: chain
+            .into_iter()
+            .map(|name| ChainMember {
+                name,
+                threshold: DEFAULT_THRESHOLD,
+                last_resort: false,
+                preferred: false,
+                max_spend: 0.0,
+                weekly_line: weekly_pct,
+                scoped_line: weekly_pct,
+                check_scoped: false,
+            })
+            .collect(),
+        switch_off_when_spent: state.switch_off_when_spent(),
+        broken,
+        burn_aware: false,
+        interval_ms,
+        burn_floor_pct: 0.0,
+        burn_horizon_cap_ms: 0,
+        spend_budget: false,
+        switch_off_when_budget_spent: false,
+        kick_rejected,
+        reading_dead: Vec::new(),
+        fresh: Vec::new(),
+    })
 }
 
 /// [`snapshot_chain`] anchored on an explicit member instead of the global
@@ -1085,6 +1169,7 @@ fn build_chain_snapshot(
         spend_budget: config.state.spend_budget_switching,
         switch_off_when_budget_spent: config.state.switch_off_when_budget_spent,
         kick_rejected: Vec::new(),
+        reading_dead: Vec::new(),
         fresh: Vec::new(),
     }
 }
@@ -1621,6 +1706,14 @@ pub(crate) fn next_auto_switch_target(
 /// from `usage`, the single per-evaluation clone of the `UsageStore` map. Split
 /// out so tests can drive the evaluation against a frozen snapshot and prove
 /// the decision depends only on its content, never on a later store mutation.
+#[cfg(test)]
+pub(crate) fn next_auto_switch_target_for_test(
+    snapshot: &ChainSnapshot,
+    usage: &HashMap<String, UsageInfo>,
+) -> Option<SwitchAction> {
+    next_auto_switch_target_with_usage(snapshot, usage)
+}
+
 fn next_auto_switch_target_with_usage(
     snapshot: &ChainSnapshot,
     usage: &HashMap<String, UsageInfo>,
@@ -1654,6 +1747,17 @@ fn next_auto_switch_target_with_usage(
     // not a snapshot flag — unlike `broken`/`kick_rejected` it needs no separate
     // channel.
     let active_canceled = is_canceled_from_usage(&active.name, usage);
+    // A dead-reading active is the family's fourth member: its usage-reading
+    // channel is dead (deep-stuck `RateLimited`, windowless or absent store
+    // entry), so the live window this gate needs as evidence can never
+    // arrive — windowless reads as never-exhausted, which held the walk on
+    // the member forever while a viable sibling idled (issue #83). Unlike
+    // the neighbors the account itself may be fine; what is dead is the
+    // CHANNEL, and only a deep streak plus no window at all qualifies — a
+    // lapsed or headroom window keeps the walk's own judgment, since the
+    // last Fresh read is a trustworthy verdict the existing rules already
+    // weigh.
+    let active_reading_dead = snapshot.reading_dead.iter().any(|n| n == &active.name);
     let active_exhausted = is_exhausted_active_from_usage(
         active,
         snapshot.burn_aware,
@@ -1684,7 +1788,12 @@ fn next_auto_switch_target_with_usage(
         !is_exhausted_from_usage(m, usage, m.weekly_line) && !scoped_blocked_from_usage(m, usage)
     };
 
-    if !active_broken && !active_kick_rejected && !active_canceled && !active_exhausted {
+    if !active_broken
+        && !active_kick_rejected
+        && !active_canceled
+        && !active_reading_dead
+        && !active_exhausted
+    {
         // Scoped active trigger: a per-model weekly line crossed on an
         // otherwise-healthy active (its `check_scoped` gate on) hops ONLY
         // when a clear member exists. When every sibling is equally blocked

@@ -77,6 +77,12 @@ use serde_json::Value;
 use crate::logline::logline;
 use crate::profile::ClaudeCredentials;
 
+macro_rules! census_log {
+    ($($arg:tt)*) => {
+        crate::logline::to_logfile(format_args!($($arg)*))
+    };
+}
+
 /// Apple's Keychain CLI. Absolute path so a hostile `PATH` can't shim it.
 const SECURITY_BIN: &str = "/usr/bin/security";
 
@@ -1022,26 +1028,23 @@ fn delete_at(service: &str, account: &str) -> Result<()> {
     }
 }
 
-/// Delete the NAMESPACED Keychain item at an already-derived `service` — the
-/// stale-runtime GC's collector for a runtime tree it just removed
-/// (`runtime::gc_one_pair`). The item holds a login only that tree's dir hash
-/// resolves, so once the dir is gone it is inert clutter; this is the
-/// collector half of the m4 LEAVE ruling (2026-09-12:
-/// teardown pays no `security` subprocess, the GC pays it here instead).
-///
-/// Guarded on the service SHAPE (`claude::is_namespaced_keychain_service`):
-/// this deletes by name, and a caller handing it the bare item — or anything
-/// else the naming rule cannot have produced — would destroy a login no GC
-/// decision explains. Idempotent like [`delete_at`]: a missing item is `Ok`,
-/// so a re-run after a half-completed sweep costs one subprocess and nothing
-/// else.
-pub(crate) fn delete_namespaced_item(service: &str) -> Result<()> {
-    anyhow::ensure!(
-        crate::claude::is_namespaced_keychain_service(service),
-        "refusing to delete Keychain item `{service}` through the GC path: it is not a \
-         per-config-dir item name"
-    );
-    delete_at(service, &account()?)
+/// Collect a NAMESPACED Keychain item through the shared salvage-then-delete
+/// core: any readable bytes are quarantined first ([`quarantine_item_bytes`]),
+/// then the item is deleted, and what the salvage saw rides the outcome for
+/// the caller's event line — a refused or prompted read (a foreign item's ACL,
+/// a locked keychain) is named, never fabricated as success. The ordering is
+/// pinned cross-platform in [`crate::claude::salvage_delete_namespaced_item_with`];
+/// this is the macOS wiring only.
+pub(crate) fn salvage_delete_namespaced_item(
+    service: &str,
+) -> Result<crate::claude::SalvageOutcome> {
+    crate::claude::salvage_delete_namespaced_item_with(
+        service,
+        &account()?,
+        read_raw_at,
+        quarantine_item_bytes,
+        delete_at,
+    )
 }
 
 /// The census half of the m4 LEAVE ruling's collector (2026-09-12): collect
@@ -1051,12 +1054,11 @@ pub(crate) fn delete_namespaced_item(service: &str) -> Result<()> {
 /// stranding inputs (a canonicalize failure, a crash between the tombstone
 /// rename and the post-closure delete, a stuck-keychain delete failure) leave
 /// items no walked dir explains. `security dump-keychain` lists everything,
-/// the historical orphans included; the pure decision
-/// ([`crate::claude::census_orphan_keychain_services`]) deletes only a
-/// NAMESPACED service outside `live` — the set
-/// [`crate::runtime::live_namespaced_keychain_services`] derives from the dirs
-/// it enumerates — so a live dir's item is never touched and a live foreign
-/// `CLAUDE_CONFIG_DIR` item is accepted collateral (ruled 2026-09-12).
+/// but the pure decision ([`crate::claude::census_orphan_keychain_services`])
+/// admits only services in clauth's durable ownership ledger and outside the
+/// `live` set [`crate::runtime::live_namespaced_keychain_services`] derives from
+/// runtime dirs. A foreign `CLAUDE_CONFIG_DIR` item enters neither source and is
+/// untouched; an unreadable ledger or live set deletes nothing.
 ///
 /// Runs on every `clauth mcp` boot (accepted with the ruling). Skipped whole
 /// under the Plugin tab's boot probe ([`crate::mcp::MCP_PROBE_ENV`]), whose 3 s
@@ -1084,17 +1086,27 @@ pub(crate) fn census_namespaced_items() {
     let dump = match dump_keychain() {
         Ok(dump) => dump,
         Err(e) => {
-            logline!(
+            census_log!(
                 "clauth: the Keychain census failed ({e:#}); orphaned per-session items stay in \
                  the Keychain until a later census"
             );
             return;
         }
     };
-    let orphans = match crate::runtime::live_namespaced_keychain_services() {
-        Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live),
+    let owned = match crate::runtime::namespaced_keychain_ledger::owned_services() {
+        Ok(owned) => owned,
         Err(e) => {
-            logline!(
+            census_log!(
+                "clauth: the Keychain census cannot read its ownership ledger ({e:#}); deleting \
+                 nothing — unreadable ownership must never authorize a delete"
+            );
+            return;
+        }
+    };
+    let orphans = match crate::runtime::live_namespaced_keychain_services() {
+        Ok(live) => crate::claude::census_orphan_keychain_services(&dump, &live, &owned),
+        Err(e) => {
+            census_log!(
                 "clauth: the Keychain census cannot derive the live set ({e:#}); deleting nothing \
                  — an underivable set must never read as every item orphaned"
             );
@@ -1110,7 +1122,7 @@ pub(crate) fn census_namespaced_items() {
         let live = match crate::runtime::live_namespaced_keychain_services() {
             Ok(live) => live,
             Err(e) => {
-                logline!(
+                census_log!(
                     "clauth: the Keychain census cannot re-derive the live set ({e:#}); stopping \
                      the census, the remaining items stay for a later one"
                 );
@@ -1120,12 +1132,17 @@ pub(crate) fn census_namespaced_items() {
         if live.contains(&service) {
             continue;
         }
-        match delete_namespaced_item(&service) {
-            Ok(()) => logline!(
-                "clauth: collected the orphaned per-session Keychain item {service} (no existing \
-                 config dir explains it)"
-            ),
-            Err(e) => logline!(
+        match salvage_delete_namespaced_item(&service) {
+            Ok(salvage) => {
+                let retirement = crate::runtime::namespaced_keychain_ledger::retire(&service);
+                census_log!(
+                    "clauth: collected the orphaned per-session Keychain item {service} (no existing \
+                     config dir explains it); {}; {}",
+                    crate::claude::salvage_tail(&salvage),
+                    crate::claude::retirement_tail(&retirement)
+                );
+            }
+            Err(e) => census_log!(
                 "clauth: collecting the orphaned per-session Keychain item {service} failed: \
                  {e:#}. It stays inert in the Keychain until a later census removes it"
             ),
@@ -1179,28 +1196,79 @@ impl SecurityOp {
 /// fragment of the written value into exactly this builder (`unknown command
 /// "<tail>"`, observed in the field, GH #66), and this text rides event lines
 /// into `daemon.log` — so a write failure reports the exit code and the stderr
-/// byte COUNT, never the bytes.
+/// byte COUNT, never the bytes. The one exception is the classified
+/// locked-keychain transient (exit 36, `errSecInteractionNotAllowed`): its
+/// diagnostic lives in exactly those withheld bytes, so the classification
+/// names the cause as a HARDCODED literal keyed on the code
+/// ([`crate::claude::SecurityExitClass::cause`]) instead of embedding them.
 fn security_error(op: SecurityOp, output: &std::process::Output) -> anyhow::Error {
-    let code = output
-        .status
-        .code()
-        .map_or_else(|| "signal".to_string(), |c| c.to_string());
-    match op {
-        SecurityOp::Write => anyhow::anyhow!(
-            "Keychain {} failed (security exit {code}): its {}-byte stderr is not shown, because \
-             a write's stderr can echo the value being written",
-            op.as_str(),
-            output.stderr.len()
-        ),
+    let code = output.status.code();
+    let class = code.map_or(
+        crate::claude::SecurityExitClass::Unclassified,
+        crate::claude::classify_security_exit,
+    );
+    let rendered = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
+    let message = match op {
+        SecurityOp::Write => match class.cause() {
+            Some(cause) => format!(
+                "Keychain {} failed (security exit {rendered}): {cause}",
+                op.as_str()
+            ),
+            None => format!(
+                "Keychain {} failed (security exit {rendered}): its {}-byte stderr is not shown, \
+                 because a write's stderr can echo the value being written",
+                op.as_str(),
+                output.stderr.len()
+            ),
+        },
         SecurityOp::Read | SecurityOp::Delete | SecurityOp::Census => {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::anyhow!(
-                "Keychain {} failed (security exit {code}): {}",
+            format!(
+                "Keychain {} failed (security exit {rendered}): {}",
                 op.as_str(),
                 stderr.trim()
             )
         }
+    };
+    anyhow::Error::new(SecurityFailure { code, message })
+}
+
+/// A failed `security` invocation as an error value. Its `Display` is exactly
+/// the message the event lines have always rendered ([`security_error`]'s
+/// wording, per arm), and it carries the exit code so a caller that ACTS on a
+/// failure can classify it ([`classified_exit`]) instead of parsing that text.
+/// The tool's stderr bytes stay out of the type: the write arm renders a count
+/// of them precisely because they can echo the written value, and carrying
+/// them here would put them one `{:?}` from an event line. Derived `Debug` is
+/// safe for the same reason — the fields are the code and the already-public
+/// message, never credential bytes (unlike [`UnparseableItem`]'s hand-written
+/// one).
+#[derive(Debug)]
+struct SecurityFailure {
+    code: Option<i32>,
+    message: String,
+}
+
+impl std::fmt::Display for SecurityFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
     }
+}
+
+impl std::error::Error for SecurityFailure {}
+
+/// The classification of a failed `security` invocation's exit status, when
+/// the error carries one; `Unclassified` for every other error (a spawn
+/// failure, a deadline kill — neither reports an exit code). The one seam the
+/// sites that ACT on a failure consult, so the seed's retry and the sign-out's
+/// skip share `claude`'s single table instead of each re-deriving it.
+pub(crate) fn classified_exit(e: &anyhow::Error) -> crate::claude::SecurityExitClass {
+    e.downcast_ref::<SecurityFailure>()
+        .and_then(|failure| failure.code)
+        .map_or(
+            crate::claude::SecurityExitClass::Unclassified,
+            crate::claude::classify_security_exit,
+        )
 }
 
 /// Install `store`, the whole JSON object the file layer put in the live slot,
@@ -1228,8 +1296,18 @@ pub(crate) fn keychain_install(store: &Value) -> Result<()> {
 /// Same merge codepath, same [`Keep::CarriedOnly`] (the MCP-login carry needs
 /// no rule of its own), and the same non-object refusal as [`keychain_install`]:
 /// one Keychain path, two service names.
-pub(crate) fn keychain_install_for_config_dir(store: &Value, config_dir: &Path) -> Result<()> {
+pub(crate) fn keychain_install_for_config_dir(
+    store: &Value,
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+) -> Result<()> {
     let service = keychain_service_for_config_dir(config_dir)?;
+    anyhow::ensure!(
+        service == owned.service(),
+        "refusing to write per-session Keychain item `{service}`: the durable ownership row names \
+         `{}`",
+        owned.service()
+    );
     install_at(&service, store)
 }
 
@@ -1357,7 +1435,7 @@ fn login_blob_is_ours(blob: Option<&Value>, ours: &[&str]) -> bool {
 /// `force_link_profile_credentials` and `clear_claude_credentials` reach it,
 /// never the guarded relink, so a path that never meant to change accounts
 /// cannot destroy a login clauth does not hold (`claude::keychain_mirror_source`).
-pub(crate) fn keychain_sign_out() -> Result<()> {
+pub(crate) fn keychain_sign_out() -> Result<SignOutOutcome> {
     sign_out_at(SERVICE, &account()?)
 }
 
@@ -1367,8 +1445,35 @@ pub(crate) fn keychain_sign_out() -> Result<()> {
 /// session's Claude Code resolves this item before any file, so a departed
 /// account's login left in it (an endpoint recapture's leftover under a
 /// shared or recycled runtime dir) would keep serving that account.
-pub(crate) fn keychain_sign_out_for_config_dir(config_dir: &Path) -> Result<()> {
-    sign_out_at(&keychain_service_for_config_dir(config_dir)?, &account()?)
+pub(crate) fn keychain_sign_out_for_config_dir(
+    config_dir: &Path,
+    owned: &crate::runtime::namespaced_keychain_ledger::OwnedKeychainWrite,
+) -> Result<SignOutOutcome> {
+    let service = keychain_service_for_config_dir(config_dir)?;
+    anyhow::ensure!(
+        service == owned.service(),
+        "refusing to write per-session Keychain item `{service}`: the durable ownership row names \
+         `{}`",
+        owned.service()
+    );
+    sign_out_at(&service, &account()?)
+}
+
+/// What a sign-out actually did, so a caller whose downstream state follows
+/// the ITEM — the swap executor's row repoint — can tell an item that is
+/// really signed out from one the locked keychain left untouched. The
+/// fail-closed direction there is to keep the row naming the outgoing member
+/// over a skip, exactly as a failed write does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SignOutOutcome {
+    /// The item is signed out: stripped and rewritten, deleted, or already
+    /// absent/holding nothing account-scoped. Downstream state may follow.
+    SignedOut,
+    /// The sign-out was skipped over the classified locked-keychain
+    /// transient: the read said nothing about the item's bytes, so nothing
+    /// was touched and the item keeps serving whatever login it holds until
+    /// the operation is retried on an unlocked keychain.
+    SkippedLocked,
 }
 
 /// The sign-out core over an arbitrary `(service, account)`, parameterized the
@@ -1385,19 +1490,34 @@ pub(crate) fn keychain_sign_out_for_config_dir(config_dir: &Path) -> Result<()> 
 ///
 /// A read that fails deletes instead: whatever it could not preserve is worth
 /// less than the item continuing to authenticate an account the operator just
-/// switched away from. A read that failed WITH BYTES quarantines them first
-/// ([`quarantine_item_bytes`]) — the delete still removes the login, but the
-/// evidence survives it, and the event line says where.
-fn sign_out_at(service: &str, account: &str) -> Result<()> {
+/// switched away from. One exception, decided by
+/// [`crate::claude::failed_read_degrades_to_delete`]: a read refused by a
+/// locked keychain (the classified exit-36 transient) says nothing about the
+/// item's bytes, so it must not read as empty — that exact shape deleted a
+/// live login in the field (2026-09-12, an ssh session). The skip leaves the
+/// item untouched and says so on the event line; a re-run of the switch or
+/// clear signs out for real once the keychain unlocks, which is recoverable
+/// where the delete is not. A read that failed WITH BYTES quarantines them
+/// first ([`quarantine_item_bytes`]) — the delete still removes the login, but
+/// the evidence survives it, and the event line says where.
+fn sign_out_at(service: &str, account: &str) -> Result<SignOutOutcome> {
     // The two `None` cases part here rather than sharing an early return: an
     // absent item is already signed out and says nothing, while a read that
     // FAILED takes the most destructive branch there is, deleting the item
     // whole — now with its raw bytes quarantined first whenever the read
-    // brought any back (#66/#76).
+    // brought any back (#66/#76), and not at all over the classified
+    // locked-keychain transient.
     let mut blob = match read_blob_at(service, account) {
-        Ok(None) => return delete_at(service, account),
+        Ok(None) => return delete_at(service, account).map(|_| SignOutOutcome::SignedOut),
         Ok(Some(blob)) => blob,
         Err(e) => {
+            if !crate::claude::failed_read_degrades_to_delete(classified_exit(&e)) {
+                logline!(
+                    "clauth: could not sign Claude Code out of the macOS Keychain: {e:#}. The \
+                     item was left untouched; retry the operation once the keychain is unlocked"
+                );
+                return Ok(SignOutOutcome::SkippedLocked);
+            }
             match carried_raw(&e) {
                 Some(raw) => logline!(
                     "clauth: signed Claude Code out of the macOS Keychain by deleting the item: \
@@ -1412,7 +1532,7 @@ fn sign_out_at(service: &str, account: &str) -> Result<()> {
                      session"
                 ),
             }
-            return delete_at(service, account);
+            return delete_at(service, account).map(|_| SignOutOutcome::SignedOut);
         }
     };
     match crate::claude::strip_account_credentials(&mut blob) {
@@ -1421,16 +1541,16 @@ fn sign_out_at(service: &str, account: &str) -> Result<()> {
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
                  stores no Claude login). Run `clauth <name>` to put one back"
             );
-            delete_at(service, account)
+            delete_at(service, account).map(|_| SignOutOutcome::SignedOut)
         }
         crate::claude::SignOut::Write => {
             logline!(
                 "clauth: signed Claude Code out of the macOS Keychain (the profile now active \
                  stores no Claude login); its MCP server logins were kept"
             );
-            put_blob_at(service, account, &blob)
+            put_blob_at(service, account, &blob).map(|_| SignOutOutcome::SignedOut)
         }
-        crate::claude::SignOut::Nothing => Ok(()),
+        crate::claude::SignOut::Nothing => Ok(SignOutOutcome::SignedOut),
     }
 }
 

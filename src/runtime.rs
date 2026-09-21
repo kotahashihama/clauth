@@ -64,6 +64,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::claude::{build_claude_settings_json, create_symlink};
 use crate::lock::with_state_lock;
@@ -164,6 +165,13 @@ const RUNTIME_STEM: &str = "runtime";
 const SESSIONS_STEM: &str = "sessions";
 const ISOLATED_RUNTIME_STEM: &str = "runtime-isolated";
 const ISOLATED_SESSIONS_STEM: &str = "sessions-isolated";
+/// A codex session home under `profiles/<name>/`. Deliberately OUTSIDE the
+/// `runtime*`/`sessions*` stems: the config reconcilers walk
+/// [`shared_runtime_dirs`] and would drop Claude Code's `settings.json` into
+/// any dir matching those, and the GC pairing rule would collect a home it has
+/// no pairing story for. A codex home named off this stem falls through both
+/// untouched, which is the designed behavior, not an accident.
+pub(crate) const CODEX_HOME_STEM: &str = "codex-home";
 
 impl Isolation {
     fn runtime_stem(self) -> &'static str {
@@ -177,6 +185,23 @@ impl Isolation {
             Isolation::Shared => SESSIONS_STEM,
             Isolation::Isolated => ISOLATED_SESSIONS_STEM,
         }
+    }
+    /// The other flavor. Only the fake transport needs to ask: there the two
+    /// collapse to separate bare homes that do NOT share one `auth.json`.
+    fn other(self) -> Self {
+        match self {
+            Isolation::Shared => Isolation::Isolated,
+            Isolation::Isolated => Isolation::Shared,
+        }
+    }
+}
+
+impl std::fmt::Display for Isolation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Isolation::Shared => "shared",
+            Isolation::Isolated => "isolated",
+        })
     }
 }
 
@@ -212,6 +237,11 @@ impl SessionId {
             std::process::id(),
             SESSION_SEQ.fetch_add(1, Ordering::Relaxed)
         ))
+    }
+
+    #[cfg(test)]
+    fn for_test(value: &str) -> Self {
+        Self(value.to_string())
     }
 
     pub(crate) fn as_str(&self) -> &str {
@@ -250,6 +280,22 @@ fn is_paired_dir_name(name: &str, stem: &str) -> bool {
 /// sweep anything a future release happens to name `runtime*`.
 fn is_runtime_dir_name(name: &str) -> bool {
     is_paired_dir_name(name, RUNTIME_STEM)
+}
+
+/// Whether `path` is a clauth CLAUDE runtime tree by position as well as name
+/// — `…/profiles/<name>/runtime*`, either flavor. The claude twin of
+/// [`is_codex_home_path`], for the cross-harness env hygiene a codex spawn
+/// performs: an inherited `CLAUDE_CONFIG_DIR` is scrubbed only when it names
+/// a tree clauth built, never the operator's own custom dir.
+pub(crate) fn is_clauth_runtime_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_runtime_dir_name)
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("profiles"))
 }
 
 /// Sibling of [`is_runtime_dir_name`] for marker dirs.
@@ -291,6 +337,30 @@ pub(crate) fn sid_of_runtime_dir_name(name: &str) -> Option<String> {
     rest.strip_prefix('-')
         .filter(|s| is_session_id(s))
         .map(str::to_string)
+}
+
+/// Whether `name` is a codex session home (`codex-home*` under a profile dir)
+/// — the codex counterpart of [`is_shared_runtime_dir_name`] for
+/// session-to-profile attribution.
+pub(crate) fn is_codex_home_dir_name(name: &str) -> bool {
+    name.starts_with(CODEX_HOME_STEM)
+}
+
+/// Whether `path` is a codex session home by POSITION as well as name:
+/// `…/profiles/<name>/codex-home*`. The positional half matters — the profile
+/// charset allows a profile literally named `codex-home`, and
+/// `profiles/codex-home` is a profile dir, not a home. The ONE spelling of
+/// that rule: the perms sweep asks it as a bool, `which`'s codex arm extracts
+/// the profile name off the same predicate.
+pub(crate) fn is_codex_home_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_codex_home_dir_name)
+        && path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .and_then(std::path::Path::file_name)
+            == Some(std::ffi::OsStr::new("profiles"))
 }
 
 /// The sessions dir paired with a runtime dir of this name, per the module's one
@@ -676,6 +746,59 @@ fn live_session_holds_rotatable(name: &ProfileName) -> bool {
     false
 }
 
+/// Live registry rows currently attributed to `profile` and holding `store`
+/// (their `launch_store` names it), counted like the tally counts sessions:
+/// attribution is `current_member` first, `start_profile` for a session that
+/// never moved, and dead rows drop by the same liveness predicate the
+/// tally/decision leg uses. Markers are never counted — a swapped session
+/// retains old-member markers for life. `session`'s own row is excluded:
+/// the caller adds the session whose write just landed by construction.
+fn sessions_holding_store(profile: &ProfileName, store: &Path, session: &SessionId) -> usize {
+    crate::live_sessions::list()
+        .into_iter()
+        .filter(|row| {
+            let member = row.current_member.as_deref().unwrap_or(&row.start_profile);
+            let probe = crate::profile::ProfileName::from(member);
+            member == profile.as_str()
+                && row.launch_store.as_deref() == Some(store)
+                && row.session_id != session.as_str()
+                && session_row_is_live(&probe, row.isolated, &row.session_id)
+        })
+        .count()
+}
+
+/// The fan-out warning decision behind the three namespaced-item install
+/// sites (the start seed, its watchdog retry, and the swap Install arm).
+/// `landed` is the item write's own outcome: only a write that completed
+/// created a new copy of the rotating pair, so a failed one returns `None` —
+/// the warning is success-shaped. `n` is the observed live count including
+/// `session` itself, whose item write just landed; the exact sentence fires
+/// only at `n >= 2`. The event line carries the profile name and the count,
+/// never credential values.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the production call sites are the macOS item-install legs; the decision is pinned on every platform"
+    )
+)]
+fn fanout_warning(
+    landed: bool,
+    profile: &ProfileName,
+    store: &Path,
+    session: &SessionId,
+) -> Option<String> {
+    if !landed {
+        return None;
+    }
+    let n = sessions_holding_store(profile, store, session) + 1;
+    (n >= 2).then(|| {
+        format!(
+            "clauth: warning: '{profile}' has {n} live sessions sharing one rotating login; run `clauth rolling-token {profile}` before one refresh signs the others out"
+        )
+    })
+}
+
 /// [`rotation_blocked_by_live_session`] against the live host and marker state —
 /// what every rotation leg and both TUI pre-refusals call.
 ///
@@ -878,6 +1001,92 @@ pub(crate) fn gc_stale_runtimes() {
     gc_live_session_rows();
     gc_bare_markers();
     crate::hook_note::gc_conversation_records();
+    gc_codex_homes();
+}
+
+/// True for a PER-SESSION codex home name — `codex-home-<sid>` /
+/// `codex-home-isolated-<sid>` — the strict form GC may `remove_dir_all`.
+/// The bare stems (the durable store, and fake mode's shared home) are
+/// deliberately NOT matched: `rest.is_empty()` is excluded, unlike
+/// [`is_paired_dir_name`], because the bare codex home holds state that must
+/// outlive every session.
+fn is_per_session_codex_home_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(CODEX_HOME_STEM) else {
+        return false;
+    };
+    let rest = rest.strip_prefix("-isolated").unwrap_or(rest);
+    rest.strip_prefix('-').is_some_and(is_session_id)
+}
+
+/// Collect codex session homes whose session died without teardown. The
+/// claude GC's pairing rule cannot see these (a codex home matches no
+/// `runtime*` stem — by design, so the reconcilers never touch it), and the
+/// marker-dir orphan branch reaps the SESSIONS dir on its own — which would
+/// leave the home tree unpairable and immortal. Same liveness rule as every
+/// other sweep: a dir whose paired marker dir holds a live flock is spared,
+/// and so is one whose liveness cannot be READ (unknown reads as live).
+fn gc_codex_homes() {
+    let Ok(root) = profiles_root_dir() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return;
+    };
+    let mut candidates: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for profile in entries.flatten() {
+        let profile = profile.path();
+        let Ok(children) = std::fs::read_dir(&profile) else {
+            continue;
+        };
+        for child in children.flatten() {
+            let file_name = child.file_name();
+            let Some(child_name) = file_name.to_str() else {
+                continue;
+            };
+            if !is_per_session_codex_home_name(child_name) {
+                continue;
+            }
+            // `codex-home<rest>` pairs with `sessions<rest>` — the same
+            // `<rest>` convention the runtime pairing uses. A missing marker
+            // dir reads as DEAD, not live: the acquire creates the marker
+            // before the home, so a home with no marker dir is a crashed
+            // teardown's leftover, and sparing it would be the immortality
+            // this sweep exists to end.
+            let Some(rest) = child_name.strip_prefix(CODEX_HOME_STEM) else {
+                continue;
+            };
+            candidates.push((child.path(), profile.join(format!("{SESSIONS_STEM}{rest}"))));
+        }
+    }
+    // Peek before locking, like `gc_bare_markers`: nothing to collect must not
+    // pay the state flock's wait, which a macOS switch legitimately holds for
+    // ~20s. A home that appears after the peek is the next sweep's, which is
+    // the whole contract of a best-effort GC.
+    if candidates.is_empty() {
+        return;
+    }
+    let _ = with_state_lock(|_held| {
+        for (home, sessions) in candidates {
+            // The liveness read and the removal BOTH belong under the state
+            // lock, because the acquire's whole critical section runs under it
+            // and the marker's flock is taken AFTER the home is built. Read
+            // unlocked, the entire `build_codex_home` window shows a home
+            // present beside a marker dir that is empty — indistinguishable
+            // from a crash's leftover — and this sweep would reap a session
+            // that is starting. Under the lock the only two states left are
+            // "not begun" (no home) and "finished" (flock held).
+            let dead = if sessions.exists() {
+                matches!(live_sessions_at(&sessions), Some(0))
+            } else {
+                true
+            };
+            if dead {
+                let _ = std::fs::remove_dir_all(&home);
+                let _ = std::fs::remove_dir(&sessions);
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    });
 }
 
 fn gc_runtime_trees() {
@@ -990,6 +1199,174 @@ pub(crate) fn live_namespaced_keychain_services() -> Result<BTreeSet<String>> {
     Ok(live)
 }
 
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the ownership ledger is consumed by macOS Keychain writes and census; its persistence and decisions are pinned on every platform"
+    )
+)]
+pub(crate) mod namespaced_keychain_ledger {
+    use super::*;
+
+    const PATH: &str = "keychain-item-owners.json";
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(crate) struct Owner {
+        pub(crate) service: String,
+        pub(crate) profile: ProfileName,
+        pub(crate) session: String,
+    }
+
+    #[derive(Debug, Default, Serialize, Deserialize)]
+    pub(crate) struct Owners {
+        pub(crate) owners: Vec<Owner>,
+    }
+
+    pub(crate) fn path() -> Result<PathBuf> {
+        Ok(clauth_dir()?.join(PATH))
+    }
+
+    pub(crate) fn load() -> Result<Owners> {
+        let path = path()?;
+        let owners = match std::fs::read_to_string(&path) {
+            Ok(body) => serde_json::from_str::<Owners>(&body)
+                .with_context(|| format!("failed to parse {}", path.display()))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Owners::default()),
+            Err(e) => return Err(e).with_context(|| format!("failed to read {}", path.display())),
+        };
+        // The ledger is an external boundary: what a clauth writer records is
+        // always shape-valid, so anything outside the shapes clauth itself
+        // mints is a hand edit or corruption and must fail the WHOLE ledger
+        // closed — an invalid row can never mint delete authority, and neither
+        // can its valid siblings.
+        for owner in &owners.owners {
+            if !crate::claude::is_namespaced_keychain_service(&owner.service) {
+                anyhow::bail!(
+                    "the namespaced Keychain ownership ledger names a service the naming rule \
+                     could not produce (`{}`) — refusing to authorize any delete",
+                    owner.service
+                );
+            }
+            if let Err(e) = crate::actions::validate_name_chars(owner.profile.as_str()) {
+                anyhow::bail!(
+                    "the namespaced Keychain ownership ledger holds an invalid profile name \
+                     (`{}`): {e} — refusing to authorize any delete",
+                    owner.profile
+                );
+            }
+            if !is_session_id(&owner.session) {
+                anyhow::bail!(
+                    "the namespaced Keychain ownership ledger holds a session id outside the \
+                     minted shape (`{}`) — refusing to authorize any delete",
+                    owner.session
+                );
+            }
+        }
+        Ok(owners)
+    }
+
+    pub(crate) fn save(owners: &Owners) -> Result<()> {
+        let path = path()?;
+        if let Some(parent) = path.parent() {
+            crate::profile::mkdir_700(parent)
+                .context("failed to create the namespaced Keychain ownership ledger directory")?;
+            crate::profile::enforce_clauth_perms(parent);
+        }
+        let bytes = serde_json::to_vec_pretty(owners)
+            .context("failed to serialize the namespaced Keychain ownership ledger")?;
+        atomic_write_600(&path, bytes)
+            .context("failed to persist the namespaced Keychain ownership ledger")
+    }
+
+    pub(crate) fn owned_services() -> Result<BTreeSet<String>> {
+        Ok(load()?
+            .owners
+            .into_iter()
+            .map(|owner| owner.service)
+            .collect())
+    }
+
+    pub(crate) fn record_with(
+        service: &str,
+        profile: &ProfileName,
+        session: &SessionId,
+        persist: impl FnOnce(&Owners) -> Result<()>,
+    ) -> Result<()> {
+        with_state_lock(|_held| {
+            let mut owners = load()?;
+            if let Some(owner) = owners
+                .owners
+                .iter_mut()
+                .find(|owner| owner.service == service)
+            {
+                owner.profile = profile.clone();
+                owner.session = session.as_str().to_string();
+            } else {
+                owners.owners.push(Owner {
+                    service: service.to_string(),
+                    profile: profile.clone(),
+                    session: session.as_str().to_string(),
+                });
+            }
+            persist(&owners)
+        })
+    }
+
+    pub(crate) fn retire(service: &str) -> Result<()> {
+        with_state_lock(|_held| {
+            let mut owners = load()?;
+            let before = owners.owners.len();
+            owners.owners.retain(|owner| owner.service != service);
+            if owners.owners.len() != before {
+                save(&owners)?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn authorize_write(
+        runtime: &Path,
+        profile: &ProfileName,
+        session: &SessionId,
+    ) -> Result<OwnedKeychainWrite> {
+        authorize_write_with(runtime, profile, session, save)
+    }
+
+    pub(crate) fn authorize_write_with(
+        runtime: &Path,
+        profile: &ProfileName,
+        session: &SessionId,
+        persist: impl FnOnce(&Owners) -> Result<()>,
+    ) -> Result<OwnedKeychainWrite> {
+        let service =
+            crate::claude::namespaced_keychain_service(&runtime.canonicalize().with_context(
+                || format!("failed to canonicalize config dir: {}", runtime.display()),
+            )?);
+        record_with(&service, profile, session, persist)?;
+        Ok(OwnedKeychainWrite { service })
+    }
+
+    /// Proof that a namespaced Keychain write is durably owned: minted only by
+    /// [`authorize_write`] AFTER the `(service, profile, session)` row persisted
+    /// under the state flock, and the field is private to this module so nothing
+    /// else can conjure one (the `StateLockHeld` pattern). The macOS Keychain
+    /// sinks take this witness as their only proof, so no `/usr/bin/security`
+    /// write for a per-session item can run without a durable ownership row
+    /// behind it — the ownership-first order is a type, not a call-site
+    /// convention.
+    #[derive(Debug)]
+    pub(crate) struct OwnedKeychainWrite {
+        service: String,
+    }
+
+    impl OwnedKeychainWrite {
+        pub(crate) fn service(&self) -> &str {
+            &self.service
+        }
+    }
+}
+
 /// Drop the markers of bare `claude` sessions that have exited — the ordinary
 /// case, since such a session never runs clauth code and leaves its file behind.
 /// The same per-entry prune the paired trees get, minus the tree removal: this
@@ -1088,6 +1465,20 @@ fn rescue_tombstone(tombstone: &Path) {
 /// tombstone under the lock and rescued outside it, so the flock is never held
 /// across a tree-sized copy; a shared tree is removed under the lock as before.
 fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
+    gc_one_pair_synced(runtime, sessions, || {})
+}
+
+/// [`gc_one_pair`] with the re-mint interleave point exposed for the pin:
+/// `remint_interleave` runs after the collection's state-flock closure and
+/// before the Keychain item's delete — the window in which a concurrently
+/// starting session re-mints this same path (its whole lock section: marker
+/// claim, tree rebuild, then the post-lock item seed) while the sweep sits
+/// between its collection and its delete. A no-op in production.
+fn gc_one_pair_synced(
+    runtime: &Path,
+    sessions: &Path,
+    remint_interleave: impl FnOnce(),
+) -> Result<()> {
     let isolated = runtime
         .file_name()
         .and_then(|n| n.to_str())
@@ -1103,9 +1494,10 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
 
     // macOS: the tree's namespaced Keychain service, derived while the dir
     // still exists — the derivation canonicalizes it, so it cannot run once
-    // the tree is removed. Collected after the closure below, where a
+    // the tree is removed. Collected after the closures below, where a
     // `security` subprocess is legal; `orphaned_keychain_item` documents why
-    // the dir check sits on the far side of the closure too.
+    // its inputs are re-sampled under a second closure immediately before
+    // the delete.
     #[cfg(target_os = "macos")]
     let item_service = tree_keychain_service(runtime);
 
@@ -1146,13 +1538,25 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
         Ok(false)
     })?;
 
-    // macOS: collect the tree's Keychain item, before the rescue — the delete
-    // is one subprocess, the rescue is a tree-sized copy, and a crash during
-    // the copy must not strand an item whose dir is already gone.
+    remint_interleave();
+
+    // macOS: collect the tree's Keychain item, before the rescue — the
+    // collection is a salvage read then a delete (two subprocesses), the rescue
+    // is a tree-sized copy, and a crash during the copy must not strand an item
+    // whose dir is already gone. The pair is re-checked under a fresh
+    // state-lock hold taken immediately before the delete: between the
+    // collection above and this point a concurrently starting session can
+    // re-mint this same path, and the delete must key on the world it runs in.
+    // Lock taken, inputs sampled, lock dropped, THEN the collection — the
+    // subprocesses still never span the flock.
     #[cfg(target_os = "macos")]
-    if let Some(service) =
-        orphaned_keychain_item(item_service.as_deref(), runtime.symlink_metadata().is_ok())
-    {
+    if let Some(service) = with_state_lock(|_held| {
+        Ok::<_, anyhow::Error>(orphaned_keychain_item(
+            item_service.as_deref(),
+            prune_stale_sessions(sessions),
+            runtime.symlink_metadata().is_ok(),
+        ))
+    })? {
         collect_orphaned_keychain_item(service);
     }
 
@@ -1163,33 +1567,44 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
 }
 
 /// The namespaced Keychain item a collected runtime tree leaves behind, if
-/// any: the tree's derived service when the dir that explains the item is
-/// GONE, `None` when the dir survives or no service was derived. PURE (the
-/// `session_seed_arm` split) so the keep/delete rule is pinned on every
-/// platform; the `security` delete it feeds is macOS-only and unreachable
-/// under `cfg(test)`, where `keychain::enabled()` is false.
+/// any: the tree's derived service when nothing live explains the item — no
+/// flock-held marker left in the paired sessions dir, and the dir that
+/// explains the item GONE — `None` otherwise. PURE (the `session_seed_arm`
+/// split) so the keep/delete rule is pinned on every platform; the `security`
+/// delete it feeds is macOS-only and unreachable under `cfg(test)`, where
+/// `keychain::enabled()` is false.
 ///
 /// The rows, and why each keeps or collects:
-/// - a LIVE pair — the lock's liveness re-check spared it — keeps its dir, so
-///   its item stays: a live session's Claude Code reads that item (CC resolves
-///   the Keychain before any file, namespaced per `CLAUDE_CONFIG_DIR`).
+/// - a LIVE pair — the lock's liveness re-check spared it — keeps its dir and
+///   holds its marker, so its item stays: a live session's Claude Code reads
+///   that item (CC resolves the Keychain before any file, namespaced per
+///   `CLAUDE_CONFIG_DIR`).
 /// - a pair the sweep could not collect (a failed tombstone rename, an
 ///   unreadable tree) keeps its dir, and its item with it.
 /// - a collected pair (the shared tree removed, the isolated tree renamed to
-///   its rescue tombstone) has no dir: its item is orphaned — only that dir's
-///   hash resolved it — and is collected.
+///   its rescue tombstone) has no dir and no live marker: its item is
+///   orphaned — only that dir's hash resolved it — and is collected.
 /// - a runtime dir that never existed (the orphaned-marker arm; a crash
 ///   between minting the marker dir and building the tree) derived no service,
 ///   and no tree ever hosted a session seed to write an item.
+/// - a RE-MINTED pair — a concurrently starting session re-claimed the path
+///   between the collection and the delete (#82) — holds its marker again, so
+///   its item stays even before its dir is rebuilt: a live marker outranks
+///   dir existence. An unreadable sessions dir (`None`) reads as live for the
+///   same reason every destructive level here folds an unknown into sparing.
 ///
-/// The dir check runs AFTER the state-flock closure on purpose: the delete is
-/// a subprocess and must never span the flock, and between the collection and
-/// the delete a session can re-mint the same sid (acquire wipes a stale tree
-/// at its own path and rebuilds), so the check is against the world the
-/// delete will run in — a dir that reappeared reads as live and keeps its
-/// item. The residual window (a re-minted session's whole acquire plus item
-/// seed landing between this check and the delete) is the same post-lock
-/// subprocess window the swap's keychain legs accept.
+/// Both inputs are sampled in a fresh state-lock hold taken immediately
+/// before the delete, never inside the collection's: the delete is a
+/// subprocess and must never span the flock, so the lock is taken, the inputs
+/// read, and dropped, and only then does the delete run — serialized against
+/// an acquire's own lock section, which claims the marker and rebuilds the
+/// tree as one step. The residual window is the narrowed tail only: a queued
+/// acquire completing its lock section and seeding the item anywhere between
+/// this re-check passing and the delete completing — whether the delete is
+/// already in flight or the sweep has merely not reached the spawn yet.
+/// Accepted here; the airtight shape — a durable in-flight-delete record the
+/// seed consults before writing — is a separate backlog item, not this
+/// narrowing's to grow into.
 #[cfg_attr(
     not(target_os = "macos"),
     allow(
@@ -1197,8 +1612,12 @@ fn gc_one_pair(runtime: &Path, sessions: &Path) -> Result<()> {
         reason = "the only consumer is the macOS stale-runtime GC's Keychain collection; the decision is pinned on every platform"
     )
 )]
-fn orphaned_keychain_item(service: Option<&str>, dir_exists: bool) -> Option<&str> {
-    service.filter(|_| !dir_exists)
+fn orphaned_keychain_item(
+    service: Option<&str>,
+    live_markers: Option<usize>,
+    dir_exists: bool,
+) -> Option<&str> {
+    service.filter(|_| live_markers == Some(0) && !dir_exists)
 }
 
 /// macOS: the namespaced Keychain service for a runtime dir the GC is walking,
@@ -1217,24 +1636,34 @@ fn tree_keychain_service(runtime: &Path) -> Option<String> {
     crate::keychain::keychain_service_for_config_dir(runtime).ok()
 }
 
-/// macOS: delete one orphaned namespaced Keychain item — the collector half of
+/// macOS: collect one orphaned namespaced Keychain item — the collector half of
 /// the m4 LEAVE ruling (2026-09-12: a session's item is
-/// never cleared at teardown, so this sweep is what clears it). Runs after the
+/// never cleared at teardown, so this sweep is what clears it). Goes through
+/// the same salvage-then-delete core the census takes: any readable bytes are
+/// quarantined first, a refused or prompted read (a foreign item's ACL, a
+/// locked keychain) is named on the event line rather than read as success,
+/// and the ownership row is retired only after the delete lands so a failed
+/// collection stays collectible by a later census. Runs after the
 /// state-flock closure (a `security` subprocess must never span it), inside
 /// the shared subprocess budget [`gc_stale_runtimes`] arms, and is
-/// loud-not-fatal: the item is inert without its dir, so a failed delete
+/// loud-not-fatal: the item is inert without its dir, so a failed collection
 /// leaves stale clutter rather than breaking anything.
 #[cfg(target_os = "macos")]
 fn collect_orphaned_keychain_item(service: &str) {
-    match crate::keychain::delete_namespaced_item(service) {
-        Ok(()) => logline!(
-            "clauth: collected the orphaned per-session Keychain item {service} (its runtime tree \
-             is gone)"
-        ),
+    match crate::keychain::salvage_delete_namespaced_item(service) {
+        Ok(salvage) => {
+            let retirement = namespaced_keychain_ledger::retire(service);
+            logline!(
+                "clauth: collected the orphaned per-session Keychain item {service} (its runtime tree \
+                 is gone); {}; {}",
+                crate::claude::salvage_tail(&salvage),
+                crate::claude::retirement_tail(&retirement)
+            );
+        }
         Err(e) => logline!(
             "clauth: collecting the orphaned per-session Keychain item {service} failed: {e:#}. It \
              holds a login only the removed tree's dir resolved, so it stays inert in the Keychain \
-             until a later sweep removes a tree at the same path"
+             until a later sweep or census removes it"
         ),
     }
 }
@@ -1286,10 +1715,11 @@ pub(crate) fn shared_runtime_dirs() -> Vec<PathBuf> {
 /// [`has_live_session`], which also counts shared sessions) and on the projects
 /// dir existing, so a shared-only or not-yet-written runtime is skipped.
 /// Fail-soft: an unreadable profiles root or entry is skipped, never an error.
-#[allow(
-    dead_code,
-    reason = "consumed by the session index (src/sessions.rs), wired into a surface in a later phase"
-)]
+///
+/// Claude-only by roster, not by accident: the session index this feeds reads
+/// Claude Code transcripts, and a codex profile's dir — which sits in the same
+/// root — is skipped outright rather than relying on it never containing a
+/// `runtime-isolated*` child.
 pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(root) = profiles_root_dir() else {
         return Vec::new();
@@ -1297,12 +1727,22 @@ pub(crate) fn live_isolated_stores() -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(&root) else {
         return Vec::new();
     };
+    let codex = crate::codex_profiles::CodexState::load().unwrap_or_default();
+    let claude_roster: Vec<String> = crate::profile::claude_roster_names()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|n| n.to_string())
+        .collect();
     let mut out = Vec::new();
     for profile in entries.flatten() {
         let profile_name = profile.file_name();
         let Some(profile_name) = profile_name.to_str() else {
             continue;
         };
+        // Claude-first for a dual-claimed name, like every other site.
+        if codex.holds(profile_name) && !claude_roster.iter().any(|p| p == profile_name) {
+            continue;
+        }
         let profile_path = profile.path();
         let Ok(children) = std::fs::read_dir(&profile_path) else {
             continue;
@@ -1821,6 +2261,30 @@ pub(crate) enum SwapRefused {
     /// sessions sharing one marker identity, and teardown unlinks only what it
     /// owns, so the survivor would be reported dead while it runs.
     MarkerNotLockable,
+    /// A same-member convergence's macOS carry-back of the per-session
+    /// Keychain item failed with a non-transient class. The class keys the
+    /// once-per-(member, reason) announcement; the classified locked-keychain
+    /// transient never arrives here ([`converge_leg_disposition`] stops it
+    /// silently).
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "constructed only by the macOS convergence legs; the memo pins construct it on every platform"
+        )
+    )]
+    ConvergeCarryFailed(crate::claude::SecurityExitClass),
+    /// The convergence's macOS sign-out leg failed with a non-transient class
+    /// — the twin of [`Self::ConvergeCarryFailed`] so a carry failure and a
+    /// sign-out failure stay distinct reasons to the announcement memo.
+    #[cfg_attr(
+        not(target_os = "macos"),
+        allow(
+            dead_code,
+            reason = "constructed only by the macOS convergence legs; the memo pins construct it on every platform"
+        )
+    )]
+    ConvergeSignOutFailed(crate::claude::SecurityExitClass),
 }
 
 impl std::fmt::Display for SwapRefused {
@@ -1844,6 +2308,14 @@ impl std::fmt::Display for SwapRefused {
             Self::MarkerNotLockable => {
                 f.write_str("its liveness marker is held by another process")
             }
+            Self::ConvergeCarryFailed(class) => write!(
+                f,
+                "carrying its per-session Keychain pair back failed ({class:?})"
+            ),
+            Self::ConvergeSignOutFailed(class) => write!(
+                f,
+                "signing its per-session Keychain item out failed ({class:?})"
+            ),
         }
     }
 }
@@ -2130,6 +2602,24 @@ impl ShutdownFlag {
     }
 }
 
+/// Whether the same-member source transition the convergence admits holds:
+/// the canonical the cell names parses refreshable while the profile's
+/// install source now selects a DISTINCT refreshless store. Unknown and
+/// unreadable inputs fail the predicate — do nothing, and the existing
+/// fail-closed rotation refusal stays in place.
+fn converge_transition_holds(current: &Path, selected: &Path) -> bool {
+    if current == selected {
+        return false;
+    }
+    let refreshable = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(current)
+        .ok()
+        .is_some_and(|c| c.refresh_token().is_some());
+    let refreshless = crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(selected)
+        .ok()
+        .is_some_and(|c| c.refresh_token().is_none());
+    refreshable && refreshless
+}
+
 /// The per-session credential swap executor: a live `clauth start` session moving
 /// from the account it launched on to another chain member, without a restart and
 /// without letting a rotation spend a single-use refresh token the live Claude
@@ -2259,14 +2749,16 @@ impl SessionSwap {
 
     /// The swap leg of this session's own watchdog tick: execute a move when the
     /// daemon has named a member that differs from the one the link resolves to.
-    /// The daemon writes `intended_member` only for a row whose `follows_chain` is
-    /// set, which `clauth start --with-fallback` is the only thing that requests, so
-    /// a plain `start` session polls and finds nothing to do.
+    /// The daemon writes `intended_member` only for a row whose `follows_chain`
+    /// is set (`clauth start --with-fallback` requests that), and `clauth
+    /// switch <sid> <profile>` writes one for any live claude row, so a plain
+    /// `start` session no writer has targeted polls and finds nothing to do.
     fn poll(&self) {
         let Some(intended) = crate::live_sessions::get(self.session.as_str())
             .and_then(|row| row.intended_member)
             .filter(|intended| *intended != self.member())
         else {
+            self.poll_converge();
             return;
         };
         let sid = self.session.as_str();
@@ -2276,6 +2768,31 @@ impl SessionSwap {
             }
             Ok(SwapOutcome::Refused(why)) => self.announce_refusal(&intended, why),
             Err(e) => logline!("clauth: session {sid} could not swap onto {intended}: {e:#}"),
+        }
+    }
+
+    /// The in-place convergence leg: with no cross-member intent standing,
+    /// detect whether this session's own member was armed for rolling tokens
+    /// under it — the canonical still refreshable while the install source now
+    /// selects a refreshless sidecar — and move the session onto the sidecar
+    /// through the same executor. Silent on a refusal: the no-op, the
+    /// unreadable inputs, and the locked-keychain transient are the steady
+    /// state the next poll re-detects, and the fail-closed rotation refusal
+    /// stands until the row's `launch_store` follows the link.
+    fn poll_converge(&self) {
+        let member = self.member();
+        match self.swap_to(&member) {
+            Ok(SwapOutcome::Swapped) => {
+                logline!(
+                    "clauth: session {} converged onto {member}'s rolling token",
+                    self.session.as_str()
+                );
+            }
+            Ok(SwapOutcome::Refused(_)) => {}
+            Err(e) => logline!(
+                "clauth: session {} could not converge onto {member}'s rolling token: {e:#}",
+                self.session.as_str()
+            ),
         }
     }
 
@@ -2297,6 +2814,13 @@ impl SessionSwap {
     /// it returns is the touch step's only key: `load_profile` below is what
     /// clears a crash-staged credential sidecar, and moving the store's mtime
     /// before that clearing would discard the sidecar for good.
+    ///
+    /// A same-member call compares SOURCE identity before the `AlreadyCurrent`
+    /// verdict: the one same-member shape admitted is the armed transition
+    /// ([`converge_transition_holds`] — the canonical refreshable, the install
+    /// source now selecting a distinct refreshless sidecar), which the
+    /// in-place convergence executes. Every other same-member state stays a
+    /// no-op.
     fn precondition(&self, intended: &str) -> Result<SwapPlan, SwapRefused> {
         let intended = ProfileName::from(intended);
         if self.shutdown.is_begun() {
@@ -2311,7 +2835,15 @@ impl SessionSwap {
             return Err(SwapRefused::IsolatedSession);
         }
         if intended == self.member() {
-            return Err(SwapRefused::AlreadyCurrent);
+            let store = crate::claude::install_source_path(&intended)
+                .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
+            if !converge_transition_holds(&self.canonical(), &store) {
+                return Err(SwapRefused::AlreadyCurrent);
+            }
+            return Ok(SwapPlan {
+                member: intended,
+                store,
+            });
         }
         let profile = crate::profile::load_profile(&intended)
             .map_err(|e| SwapRefused::ProfileUnreadable(format!("{e:#}")))?;
@@ -2385,6 +2917,9 @@ impl SessionSwap {
             Ok(plan) => plan,
             Err(refused) => return Ok(SwapOutcome::Refused(refused)),
         };
+        if plan.member.as_str() == self.member() {
+            return self.converge_in_place(&plan);
+        }
         let _rotation = RotationGuard::acquire(&plan.member)?;
         let link = self.runtime.join(".credentials.json");
         // The install source of the member being LEFT — what the macOS
@@ -2504,10 +3039,33 @@ impl SessionSwap {
                         .as_ref(),
                     ) {
                         SwapItemArm::Install => {
-                            match crate::claude::keychain_mirror_source_for_config_dir(
-                                &plan.store,
+                            let write = namespaced_keychain_ledger::authorize_write(
                                 &self.runtime,
+                                &plan.member,
+                                &self.session,
+                            )
+                            .and_then(|owned| {
+                                crate::claude::keychain_mirror_source_for_config_dir(
+                                    &plan.store,
+                                    &self.runtime,
+                                    &owned,
+                                )
+                            });
+                            // Before the row repoint below: the row still names
+                            // the outgoing member's store, so the fan-out count
+                            // adds this session by construction rather than off
+                            // its row. Only a landed write created a new copy
+                            // of the rotating pair, so the failed outcome
+                            // cannot raise the success-shaped warning.
+                            if let Some(line) = fanout_warning(
+                                write.is_ok(),
+                                &plan.member,
+                                &plan.store,
+                                &self.session,
                             ) {
+                                logline!("{line}");
+                            }
+                            match write {
                                 // The item now holds the incoming member's pair,
                                 // so that is what the session reads: the row's
                                 // verdict follows.
@@ -2523,11 +3081,40 @@ impl SessionSwap {
                             }
                         }
                         SwapItemArm::SignOut => {
-                            match crate::keychain::keychain_sign_out_for_config_dir(&self.runtime) {
+                            let sign_out = namespaced_keychain_ledger::authorize_write(
+                                &self.runtime,
+                                &plan.member,
+                                &self.session,
+                            )
+                            .and_then(|owned| {
+                                crate::keychain::keychain_sign_out_for_config_dir(
+                                    &self.runtime,
+                                    &owned,
+                                )
+                            });
+                            match sign_out {
                                 // The item holds nothing now, so the session
                                 // falls back to the file layer this swap moved:
                                 // the row's verdict follows.
-                                Ok(()) => self.repoint_row_store(&plan),
+                                Ok(crate::keychain::SignOutOutcome::SignedOut) => {
+                                    self.repoint_row_store(&plan)
+                                }
+                                // The locked keychain left the item untouched,
+                                // so the session still reads the outgoing
+                                // member's login out of it: the row keeps
+                                // naming that member's store — rotations stay
+                                // refused for the login the session may still
+                                // be spending, the same fail-closed direction
+                                // a failed write takes.
+                                Ok(crate::keychain::SignOutOutcome::SkippedLocked) => logline!(
+                                    "clauth: session {} swapped onto {} but signing its per-session \
+                                     Keychain item out was skipped: the keychain is locked, so the \
+                                     item was left untouched and the session keeps authenticating as \
+                                     its previous member. Rotations stay refused for it; only a later \
+                                     swap onto another member re-runs the sign-out",
+                                    self.session.as_str(),
+                                    plan.member
+                                ),
                                 Err(e) => logline!(
                                     "clauth: session {} swapped onto {} but signing its per-session \
                                      Keychain item out failed: {e:#}. The session keeps authenticating as \
@@ -2552,6 +3139,211 @@ impl SessionSwap {
             }
         }
         Ok(outcome)
+    }
+
+    /// The same-member convergence executor, reached only for a plan
+    /// [`precondition`](Self::precondition) admitted: the canonical the cell
+    /// names parses refreshable while the profile's install source now selects
+    /// a distinct refreshless sidecar. Moves the session onto the sidecar
+    /// without changing member — drain, clear the per-session Keychain item,
+    /// then repoint the link.
+    ///
+    /// ONE rotation guard spans the sequence. The state flock is taken in two
+    /// holds — the drain hold, then the commit hold after the keychain legs,
+    /// because a `security` subprocess must never span the flock. The
+    /// transition is REVALIDATED from disk at the head of the commit hold:
+    /// a profile disarmed in the gap (or a sidecar re-filled with a rotating
+    /// pair) stops the move with the row and cell untouched. Inside the
+    /// commit hold the order is the swap's own: everything fallible runs
+    /// before the link moves, and the cell publishes only once it has.
+    ///
+    /// macOS ordering is load-bearing: the item legs land BEFORE the commit.
+    /// A failed carry or sign-out returns a refusal with nothing moved — the
+    /// item still holds the rotating pair, so a repoint would strand the
+    /// session on the pair while the row said sidecar, the fail-open
+    /// direction. The bearer is never installed into the item.
+    fn converge_in_place(&self, plan: &SwapPlan) -> Result<SwapOutcome> {
+        let _rotation = RotationGuard::acquire(&plan.member)?;
+        let link = self.runtime.join(".credentials.json");
+        // The store being converged OFF of — what the macOS carry-back below
+        // writes the session's Keychain pair into. Captured inside the hold.
+        #[cfg(target_os = "macos")]
+        let mut previous_store: Option<std::path::PathBuf> = None;
+        with_state_lock(|_held| {
+            let current = self.canonical();
+            #[cfg(target_os = "macos")]
+            {
+                previous_store = Some(current.clone());
+            }
+            // DRAIN. A Claude Code re-login sitting in the runtime file belongs
+            // to the member the link STILL resolves to; once canonical moves,
+            // the next tick would write those bytes into the sidecar and the
+            // refresh token would be gone.
+            sync_credentials_unlocked(&link, &current)?;
+            Ok(())
+        })?;
+        // macOS: CARRY, then SIGN OUT — in that order, and the sign-out only
+        // runs if the carry could: the item may hold the freshest pair once CC
+        // has refreshed there, and signing out over a failed carry would
+        // destroy it. A failed leg returns a refusal with nothing moved — the
+        // session stays on the rotating pair with the row and cell naming it,
+        // and the next poll retries. A failure classified as the
+        // locked-keychain transient (the carry's Err, the sign-out's
+        // SkippedLocked) stops silently, and every other class announces once
+        // per (member, class) through the cell's refusal memo — so neither
+        // shape writes a line per tick while the keychain stays locked.
+        // `enabled()` is a runtime check so a macOS `cfg(test)` build (no
+        // keychain) converges on the file layer alone, exactly like the seed.
+        #[cfg(target_os = "macos")]
+        if crate::keychain::enabled() {
+            let carried = previous_store
+                .as_deref()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("the rotating store this session converges off of is unknown")
+                })
+                .and_then(|store| crate::claude::carry_session_item_into(store, &self.runtime));
+            match carried {
+                Ok(()) => match converge_item_arm(
+                    crate::profile::read_json_file::<crate::profile::ClaudeCredentials>(
+                        &plan.store,
+                    )
+                    .ok()
+                    .as_ref(),
+                ) {
+                    SwapItemArm::SignOut => {
+                        let sign_out = namespaced_keychain_ledger::authorize_write(
+                            &self.runtime,
+                            &plan.member,
+                            &self.session,
+                        )
+                        .and_then(|owned| {
+                            crate::keychain::keychain_sign_out_for_config_dir(&self.runtime, &owned)
+                        });
+                        match sign_out {
+                            Ok(crate::keychain::SignOutOutcome::SignedOut) => {}
+                            // The item still serves the rotating pair (locked,
+                            // or the sign-out failed): committing would repoint
+                            // the link and row while the session keeps reading
+                            // the item — the fail-open direction. Stop on the
+                            // safe side; the next poll retries.
+                            Ok(crate::keychain::SignOutOutcome::SkippedLocked) => {
+                                return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
+                            }
+                            Err(e) => {
+                                let class = crate::keychain::classified_exit(&e);
+                                // The classified locked-keychain transient is
+                                // the steady state the next poll clears once
+                                // the keychain unlocks; a line per tick for
+                                // its whole duration is the noise the seed's
+                                // disposition pattern exists to avoid. Silent
+                                // — no memo, nothing to announce.
+                                if converge_leg_disposition(class) == ConvergeLegDisposition::Silent
+                                {
+                                    return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
+                                }
+                                if self.should_announce(
+                                    plan.member.as_str(),
+                                    &SwapRefused::ConvergeSignOutFailed(class),
+                                ) {
+                                    logline!(
+                                        "clauth: session {} could not converge onto {}'s rolling \
+                                         token: signing its per-session Keychain item out failed: \
+                                         {e:#}. The session stays on the rotating pair; the next \
+                                         poll retries",
+                                        self.session.as_str(),
+                                        plan.member
+                                    );
+                                }
+                                return Ok(SwapOutcome::Refused(
+                                    SwapRefused::ConvergeSignOutFailed(class),
+                                ));
+                            }
+                        }
+                    }
+                    // Unreachable by admission (the transition selects a
+                    // refreshless store) and never executed: installing the
+                    // bearer would strand the session on a snapshot the
+                    // re-stamp leg can no longer reach.
+                    SwapItemArm::Install => {
+                        return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
+                    }
+                },
+                Err(e) => {
+                    let class = crate::keychain::classified_exit(&e);
+                    // The classified locked-keychain transient is the steady
+                    // state the next poll clears once the keychain unlocks; a
+                    // line per tick for its whole duration is the noise the
+                    // seed's disposition pattern exists to avoid. Silent — no
+                    // memo, nothing to announce.
+                    if converge_leg_disposition(class) == ConvergeLegDisposition::Silent {
+                        return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
+                    }
+                    if self.should_announce(
+                        plan.member.as_str(),
+                        &SwapRefused::ConvergeCarryFailed(class),
+                    ) {
+                        logline!(
+                            "clauth: session {} could not converge onto {}'s rolling token: \
+                             carrying the per-session Keychain pair back into the rotating store \
+                             failed: {e:#}. The session stays on the rotating pair; the next poll \
+                             retries",
+                            self.session.as_str(),
+                            plan.member
+                        );
+                    }
+                    return Ok(SwapOutcome::Refused(SwapRefused::ConvergeCarryFailed(
+                        class,
+                    )));
+                }
+            }
+        }
+        with_state_lock(|_held| {
+            // REVALIDATE the transition after the lock gap. Two holds cannot
+            // pin it: `RotationGuard::acquire` blocks, and the keychain legs
+            // above release the flock, so the profile could have been disarmed
+            // (or the sidecar re-filled) since `precondition` read it. If it
+            // no longer holds, stop on the safe side — nothing has moved, and
+            // the row and cell stay truthful.
+            if !converge_transition_holds(&self.canonical(), &plan.store) {
+                return Ok(SwapOutcome::Refused(SwapRefused::AlreadyCurrent));
+            }
+            let current = self.canonical();
+            let paths =
+                SessionPaths::resolve(&plan.member, self.isolation, &self.session, self.mode)?;
+            let claim = self.claim_markers(&paths)?;
+            if matches!(claim, MarkerClaim::Foreign) {
+                return Ok(SwapOutcome::Refused(SwapRefused::MarkerNotLockable));
+            }
+            // Re-checked in the hold for the same reason the swap's is: the
+            // sidecar could have been removed since the revalidation above.
+            if !plan.store.exists() {
+                return Ok(SwapOutcome::Refused(SwapRefused::NoCredentialStore));
+            }
+            touch_store(plan, file_mtime(&current))?;
+            relink_to_canonical(&link, &plan.store)?;
+
+            // Past here the session IS on the sidecar, so nothing may report
+            // otherwise. The row's `launch_store` follows in the same hold on
+            // every platform: the item legs landed BEFORE this hold, so the
+            // session's Claude Code already reads the file layer the link
+            // just moved.
+            self.publish_swap(plan, claim);
+            if let Err(e) =
+                crate::live_sessions::update_as_session(self.session.as_str(), |fields| {
+                    fields.set_current_member(plan.member.as_str());
+                    fields.set_last_swap_at(crate::usage::now_ms());
+                    fields.set_launch_store(plan.store.clone());
+                })
+            {
+                logline!(
+                    "clauth: session {} converged onto {}'s rolling token but its row did not \
+                     update: {e:#}",
+                    self.session.as_str(),
+                    plan.member
+                );
+            }
+            Ok(SwapOutcome::Swapped)
+        })
     }
 
     /// Point the row's rotation verdict at the store the plan repointed the
@@ -2968,6 +3760,7 @@ impl ProfileRuntime {
             let row = crate::live_sessions::LiveSession::starting(
                 &session,
                 name,
+                crate::harness::Harness::Claude,
                 isolation == Isolation::Isolated,
                 opt_in,
                 // The SAME value the runtime tree is built from below, so the
@@ -2989,7 +3782,7 @@ impl ProfileRuntime {
         // so a rotation queued behind it cannot land between the build and the
         // item write — see `seed_session_keychain_item`.
         #[cfg(target_os = "macos")]
-        seed_session_keychain_item(&canonical, &paths.runtime, name, &session);
+        let seed_retry = seed_session_keychain_item(&canonical, &paths.runtime, name, &session);
         // Released at the end of the register-and-stamp window rather than at the
         // end of this function, so a queued peer waits out that window and not the
         // watchdog arming behind it. On macOS the guard additionally spans
@@ -3063,6 +3856,15 @@ impl ProfileRuntime {
         struct WatchdogLegs {
             claude_home: PathBuf,
             swap: std::sync::Arc<SessionSwap>,
+            /// macOS: the seed's retry target while a classified locked
+            /// keychain left the session's item unwritten — see
+            /// `retry_seeded_keychain_item`. The credential tick recomputes
+            /// the seed against it: no timer of its own, one bounded
+            /// subprocess budget per attempt, and it drops the moment the
+            /// store stops matching the target or a retry fails on anything
+            /// other than the classified transient.
+            #[cfg(target_os = "macos")]
+            seed_retry: std::sync::Mutex<Option<PathBuf>>,
         }
         impl crate::watchdog::Reconcile for WatchdogLegs {
             fn config(&self) {
@@ -3077,6 +3879,11 @@ impl ProfileRuntime {
                 if let Err(e) = tick(&self.claude_home, &self.swap) {
                     logline!("clauth: watchdog tick failed: {e}");
                 }
+                // After the file reconcile and outside every lock: the retry
+                // shells out, so it must never span the state flock `tick`
+                // takes and releases itself.
+                #[cfg(target_os = "macos")]
+                retry_seeded_keychain_item(&self.swap, &self.seed_retry);
             }
             fn swap_poll(&self) {
                 self.swap.poll();
@@ -3093,6 +3900,8 @@ impl ProfileRuntime {
         let legs = WatchdogLegs {
             claude_home: claude_home.clone(),
             swap: std::sync::Arc::clone(&swap),
+            #[cfg(target_os = "macos")]
+            seed_retry: std::sync::Mutex::new(seed_retry),
         };
         // Armed HERE rather than on the spawned thread, so that `acquire`
         // returning IS the barrier proving the watch is live. Arming costs
@@ -3322,16 +4131,6 @@ impl Drop for ProfileRuntime {
     }
 }
 
-/// A [`Command`](std::process::Command) for the `claude` CLI, resolved so an
-/// npm-installed shim launches on Windows too. Rust's bare `Command::new`
-/// appends only `.exe` and skips `PATHEXT`, so a `claude.cmd`/`claude.bat` (npm
-/// global) is invisible and `start`/`delegate` fail with "program not found"
-/// even though the user runs `claude` fine by hand. `which_all` enumerates every
-/// `PATHEXT` match in `PATH` order; we prefer a native `.exe` over a `.cmd`/
-/// `.bat` shim whenever both resolve (the shim adds a cmd.exe hop, and PATH dir
-/// order could otherwise surface it first), else take the first match and let
-/// std route it through cmd.exe with hardened escaping (post-CVE-2024-24576).
-/// Unix keeps the bare lookup.
 /// clauth-owned env keys that must reach the spawned `claude` only via the
 /// target profile's runtime `settings.json`, never inherited from the parent
 /// process. A parent `claude` running profile A had these written into its own
@@ -3397,9 +4196,31 @@ pub(crate) fn guard_home_project_settings(command: &mut std::process::Command, c
     }
 }
 
+/// A [`Command`](std::process::Command) for the `claude` CLI — see
+/// [`resolve_cli_command`] for the Windows shim story.
 pub(crate) fn claude_command() -> std::process::Command {
+    resolve_cli_command("claude")
+}
+
+/// The codex CLI, resolved the same way — one home for the Windows shim
+/// quirk, so a second harness cannot re-learn it wrong.
+pub(crate) fn codex_command() -> std::process::Command {
+    resolve_cli_command("codex")
+}
+
+/// Resolve `name` into a spawnable [`Command`](std::process::Command) so an
+/// npm-installed shim launches on Windows too. Rust's bare `Command::new`
+/// appends only `.exe` and skips `PATHEXT`, so a `<name>.cmd`/`<name>.bat`
+/// (npm global) is invisible and `start`/`delegate` fail with "program not
+/// found" even though the user runs the CLI fine by hand. `which_all`
+/// enumerates every `PATHEXT` match in `PATH` order; we prefer a native
+/// `.exe` over a `.cmd`/`.bat` shim whenever both resolve (the shim adds a
+/// cmd.exe hop, and PATH dir order could otherwise surface it first), else
+/// take the first match and let std route it through cmd.exe with hardened
+/// escaping (post-CVE-2024-24576). Unix keeps the bare lookup.
+fn resolve_cli_command(name: &str) -> std::process::Command {
     #[cfg(windows)]
-    if let Ok(matches) = which::which_all("claude") {
+    if let Ok(matches) = which::which_all(name) {
         let all: Vec<std::path::PathBuf> = matches.collect();
         let chosen = all
             .iter()
@@ -3409,7 +4230,7 @@ pub(crate) fn claude_command() -> std::process::Command {
             return std::process::Command::new(path);
         }
     }
-    std::process::Command::new("claude")
+    std::process::Command::new(name)
 }
 
 /// Test-only [`detect_link_mode`] override. `try_real_symlink` always succeeds
@@ -3431,6 +4252,30 @@ fn set_link_mode_override(mode: LinkMode) {
 fn clear_link_mode_override() {
     if let Ok(mut guard) = LINK_MODE_OVERRIDE.lock() {
         *guard = None;
+    }
+}
+
+/// Test-only RAII: force the fake-symlink transport for every subsequent
+/// `detect_link_mode` for the guard's lifetime, clearing the process-global
+/// override on drop even if the test panics — so a Fake mode can never leak
+/// into a concurrent test. Without exposing the private `LinkMode` enum.
+/// Serialized against other override users by `HOME_TEST_LOCK`, which the
+/// caller already holds via its `HomeSandbox`.
+#[cfg(test)]
+pub(crate) struct ForcedFakeLinkMode;
+
+#[cfg(test)]
+impl ForcedFakeLinkMode {
+    pub(crate) fn new() -> Self {
+        set_link_mode_override(LinkMode::Fake);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ForcedFakeLinkMode {
+    fn drop(&mut self) {
+        clear_link_mode_override();
     }
 }
 
@@ -3944,9 +4789,12 @@ fn materialize_entries(pending: Vec<(PathBuf, PathBuf)>, mode: LinkMode) -> Resu
 ///
 /// Loud-not-fatal on every arm: a failed write leaves the session on the
 /// file layer — the pre-fix behavior — and a headless box whose keychain
-/// refuses must still start sessions. Nothing retries the write for THIS
-/// session; the next start on the same tree, or a later swap onto another
-/// member, re-runs it.
+/// refuses must still start sessions. The one classified transient (a locked
+/// keychain, `errSecInteractionNotAllowed`) arms a retry on this session's
+/// watchdog credential tick, which recomputes the seed while the store still
+/// matches the seed's target ([`SeedDegradeDisposition::RetryOnTick`]); every
+/// other failure leaves the re-run to the next start on the same tree, or a
+/// later swap onto another member.
 /// Which Keychain arm a session start takes, derived from the install source
 /// alone. PURE so the arm selection is pinned on every platform: the seeding
 /// itself is macOS-only and unreachable by `cfg(test)` (`keychain::enabled()`
@@ -4058,15 +4906,119 @@ fn swap_item_arm(store: Option<&crate::profile::ClaudeCredentials>) -> SwapItemA
     }
 }
 
+/// The Keychain arm for the same-member convergence, pinned pure like
+/// [`swap_item_arm`] while the macOS leg that executes it is unreachable by
+/// `cfg(test)`. The convergence admits only a refreshless selected source
+/// ([`converge_transition_holds`]), so the arm is [`SwapItemArm::SignOut`]
+/// for every store the transition can select — the bearer is never installed
+/// into the item, which would strand the session on a snapshot the re-stamp
+/// leg can no longer reach. Delegates to [`swap_item_arm`] so the one
+/// refreshless→SignOut rule has one home.
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production caller is the macOS convergence leg; the arm choice is pinned on every platform"
+    )
+)]
+fn converge_item_arm(store: Option<&crate::profile::ClaudeCredentials>) -> SwapItemArm {
+    swap_item_arm(store)
+}
+
+/// What a convergence Keychain leg does with a failure's classified exit.
+/// PURE so the routing is pinned on every platform while the legs themselves
+/// only a Mac exercises: the locked-keychain transient (the one measured
+/// shape a locked keychain hands a read back) stops silently — it is the
+/// steady state the next poll clears once the keychain unlocks, and a line
+/// per tick for its whole duration is the noise the seed's disposition
+/// pattern exists to avoid. Every other class announces through the cell's
+/// once-per-(member, reason) memo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production callers are the macOS convergence legs; the routing is pinned on every platform"
+    )
+)]
+enum ConvergeLegDisposition {
+    Silent,
+    Announce,
+}
+
+/// See [`ConvergeLegDisposition`].
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only production callers are the macOS convergence legs; the routing is pinned on every platform"
+    )
+)]
+fn converge_leg_disposition(class: crate::claude::SecurityExitClass) -> ConvergeLegDisposition {
+    match class {
+        crate::claude::SecurityExitClass::InteractionNotAllowed => ConvergeLegDisposition::Silent,
+        crate::claude::SecurityExitClass::ItemNotFound
+        | crate::claude::SecurityExitClass::Unclassified => ConvergeLegDisposition::Announce,
+    }
+}
+
+/// What the session-start Keychain seed does with a leg that failed, keyed on
+/// the `security` exit classification: the one measured transient (a locked
+/// keychain, [`crate::claude::SecurityExitClass::InteractionNotAllowed`])
+/// clears the moment the keychain unlocks, so its degrade arms a retry on this
+/// session's watchdog credential tick — the retry is the recomputation, no
+/// queue and no timer of its own — while every other failure keeps the pre-fix
+/// loud degrade. PURE so the disposition is pinned on every platform; the seed
+/// and the retry leg that consult it are macOS-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumers are the macOS seed and its watchdog-tick retry; the disposition is pinned on every platform"
+    )
+)]
+enum SeedDegradeDisposition {
+    /// Re-run the seed's carry-then-write on the watchdog's credential ticks
+    /// while the store still matches the seed's target.
+    RetryOnTick,
+    /// The pre-fix behavior: log the consequence, degrade to the file layer,
+    /// and leave the re-run to the next start on the same tree.
+    LogAndDegrade,
+}
+
+/// See [`SeedDegradeDisposition`].
+#[cfg_attr(
+    not(target_os = "macos"),
+    allow(
+        dead_code,
+        reason = "the only consumers are the macOS seed and its watchdog-tick retry; the disposition is pinned on every platform"
+    )
+)]
+fn seed_degrade_disposition(class: crate::claude::SecurityExitClass) -> SeedDegradeDisposition {
+    match class {
+        crate::claude::SecurityExitClass::InteractionNotAllowed => {
+            SeedDegradeDisposition::RetryOnTick
+        }
+        crate::claude::SecurityExitClass::ItemNotFound
+        | crate::claude::SecurityExitClass::Unclassified => SeedDegradeDisposition::LogAndDegrade,
+    }
+}
+
+/// Returns the seed's retry target — the install source the seed wrote
+/// against — while a classified locked-keychain failure left the session's
+/// item unwritten, for the watchdog's credential tick to re-run the seed
+/// against ([`retry_seeded_keychain_item`]); `None` on every other outcome,
+/// the pre-fix degrade included.
 #[cfg(target_os = "macos")]
 fn seed_session_keychain_item(
     canonical: &Path,
     runtime: &Path,
     name: &ProfileName,
     session: &SessionId,
-) {
+) -> Option<PathBuf> {
     if !crate::keychain::enabled() {
-        return;
+        return None;
     }
     let arm = session_seed_arm(
         canonical.exists(),
@@ -4076,7 +5028,11 @@ fn seed_session_keychain_item(
     );
     match arm {
         SessionSeedArm::SignOut => {
-            if let Err(e) = crate::keychain::keychain_sign_out_for_config_dir(runtime) {
+            let sign_out = namespaced_keychain_ledger::authorize_write(runtime, name, session)
+                .and_then(|owned| {
+                    crate::keychain::keychain_sign_out_for_config_dir(runtime, &owned)
+                });
+            if let Err(e) = sign_out {
                 logline!(
                     "clauth: session {} started on {}, which stores no Claude login, but signing \
                      its per-session Keychain item out failed: {e:#}. The session's Claude Code may \
@@ -4085,34 +5041,157 @@ fn seed_session_keychain_item(
                     name
                 );
             }
+            None
         }
-        SessionSeedArm::Skip => {}
+        SessionSeedArm::Skip => None,
         SessionSeedArm::Carry => {
             let _budget = crate::lock::SharedSubprocessBudget::arm(SESSION_SEED_BUDGET);
-            match crate::claude::carry_session_item_into(canonical, runtime) {
-                Ok(()) => {
-                    if let Err(e) =
-                        crate::claude::keychain_mirror_source_for_config_dir(canonical, runtime)
-                    {
-                        logline!(
-                            "clauth: session {} started on {} but writing its per-session \
-                             Keychain item failed: {e:#}. Its Claude Code falls back to the runtime \
-                             credentials file, where its next token refresh migrates into the item \
-                             and strands the stored refresh token; the next start on this tree \
-                             re-runs the write",
-                            session.as_str(),
-                            name
-                        );
+            let (what, consequence, e) =
+                match crate::claude::carry_session_item_into(canonical, runtime) {
+                    Ok(()) => {
+                        let write =
+                            namespaced_keychain_ledger::authorize_write(runtime, name, session)
+                                .and_then(|owned| {
+                                    crate::claude::keychain_mirror_source_for_config_dir(
+                                        canonical, runtime, &owned,
+                                    )
+                                });
+                        match write {
+                            Ok(()) => {
+                                // A second live session now holds this rotating
+                                // login: warn, then return. The failed arm below
+                                // created no copy and must not reach the
+                                // success-shaped warning.
+                                if let Some(line) = fanout_warning(true, name, canonical, session) {
+                                    logline!("{line}");
+                                }
+                                return None;
+                            }
+                            Err(e) => (
+                                "writing its per-session Keychain item",
+                                "Its Claude Code falls back to the runtime credentials file, where \
+                             its next token refresh migrates into the item and strands the stored \
+                             refresh token; the next start on this tree re-runs the write",
+                                e,
+                            ),
+                        }
                     }
-                }
-                Err(e) => logline!(
-                    "clauth: session {} started on {} but carrying its per-session Keychain item's \
-                     pair back into the store failed: {e:#}. The item was left untouched, so the \
-                     session's Claude Code reads whatever login it holds and falls back to the \
-                     runtime credentials file when it holds none",
-                    session.as_str(),
-                    name
-                ),
+                    Err(e) => (
+                        "carrying its per-session Keychain item's pair back into the store",
+                        "The item was left untouched, so the session's Claude Code reads whatever \
+                     login it holds and falls back to the runtime credentials file when it holds \
+                     none",
+                        e,
+                    ),
+                };
+            seed_degraded(session, name, canonical, what, consequence, &e)
+        }
+    }
+}
+
+/// Log one of the seed's loud-not-fatal leg failures and decide whether it
+/// arms the watchdog-tick retry, returning the seed's target store for that
+/// retry to guard on. The classified transient appends the retry clause to the
+/// event line; every other failure renders the pre-fix line byte-for-byte.
+/// macOS-only like its caller.
+#[cfg(target_os = "macos")]
+fn seed_degraded(
+    session: &SessionId,
+    name: &ProfileName,
+    canonical: &Path,
+    what: &str,
+    consequence: &str,
+    e: &anyhow::Error,
+) -> Option<PathBuf> {
+    if seed_degrade_disposition(crate::keychain::classified_exit(e))
+        == SeedDegradeDisposition::RetryOnTick
+    {
+        logline!(
+            "clauth: session {} started on {} but {} failed: {e:#}. {}; the watchdog retries the \
+             seed on this session's credential ticks while its store stays the seed's target, so \
+             it lands once the keychain unlocks",
+            session.as_str(),
+            name,
+            what,
+            consequence
+        );
+        return Some(canonical.to_path_buf());
+    }
+    logline!(
+        "clauth: session {} started on {} but {} failed: {e:#}. {}",
+        session.as_str(),
+        name,
+        what,
+        consequence
+    );
+    None
+}
+
+/// The watchdog-tick half of the seed's retry disposition: re-run the seed's
+/// carry-then-write against the recorded target while the session's store
+/// still resolves to it. macOS-only like the seed; called from the credential
+/// leg, OUTSIDE any state-flock hold (the carry takes its own, and a
+/// `security` subprocess must never span one), under one
+/// [`SharedSubprocessBudget`] of [`SESSION_SEED_BUDGET`] per attempt.
+///
+/// The guard is the store comparison: a mid-session swap repoints the swap
+/// cell's store and its own keychain legs own the item from there, so
+/// re-running the seed past that point would write the launch member's store
+/// into an item the session's file layer no longer matches. A retry that
+/// fails on anything other than the classified transient drops the retry and
+/// says so — the pre-fix degrade, one line, once.
+#[cfg(target_os = "macos")]
+fn retry_seeded_keychain_item(swap: &SessionSwap, seed_retry: &std::sync::Mutex<Option<PathBuf>>) {
+    let mut retry = seed_retry.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(target) = retry.take() else {
+        return;
+    };
+    if swap.canonical() != target {
+        return;
+    }
+    let _budget = crate::lock::SharedSubprocessBudget::arm(SESSION_SEED_BUDGET);
+    let failed = match crate::claude::carry_session_item_into(&target, &swap.runtime) {
+        Ok(()) => namespaced_keychain_ledger::authorize_write(
+            &swap.runtime,
+            &ProfileName::from(swap.member()),
+            &swap.session,
+        )
+        .and_then(|owned| {
+            crate::claude::keychain_mirror_source_for_config_dir(&target, &swap.runtime, &owned)
+        })
+        .err(),
+        Err(e) => Some(e),
+    };
+    // The retry's write outcome feeds the fan-out decision: a re-seed that
+    // landed copied the rotating pair into a second live session's item, a
+    // failed one created no copy.
+    if let Some(line) = fanout_warning(
+        failed.is_none(),
+        &ProfileName::from(swap.member()),
+        &target,
+        &swap.session,
+    ) {
+        logline!("{line}");
+    }
+    match failed {
+        None => {
+            logline!("clauth: re-seeded the per-session Keychain item after the keychain unlocked")
+        }
+        Some(e) => {
+            if seed_degrade_disposition(crate::keychain::classified_exit(&e))
+                == SeedDegradeDisposition::RetryOnTick
+            {
+                // Still locked: stay armed for the next tick. The seed's own
+                // line already named the retry, so a still-locked attempt adds
+                // nothing — one line at degrade time, none per tick.
+                *retry = Some(target);
+            } else {
+                logline!(
+                    "clauth: retrying the per-session Keychain item seed failed: {e:#}. Its \
+                     Claude Code keeps the runtime credentials file, where its next token refresh \
+                     migrates into the item and strands the stored refresh token; the next start \
+                     on this tree re-runs the write"
+                );
             }
         }
     }
@@ -4891,6 +5970,606 @@ fn link_entry(src: &Path, dst: &Path) -> Result<()> {
 #[cfg(not(any(unix, windows)))]
 fn link_entry(_src: &Path, _dst: &Path) -> Result<()> {
     anyhow::bail!("clauth start requires symlink support");
+}
+
+// ── codex session homes ──────────────────────────────────────────────────────
+//
+// The codex runtime mirrors the claude runtime: per-session, keyed by the same
+// minted sid, marker-flock liveness through the same `sessions[-isolated]-<sid>`
+// dirs (which is what makes `has_live_session` — and so delete/disable/rotation
+// gating — work for codex with no harness awareness), registered in the same
+// live-session registry with the codex tag. What it does NOT mirror: no swap
+// executor, no settings/claude-json watchdog legs, no legacy marker (a binary
+// old enough to probe the bare marker dirs predates codex profiles entirely and
+// never gates on their names), and no wipe of the profile-global store.
+
+/// The stem of a codex home of this flavor. Both spell a `codex-home` prefix,
+/// so [`is_codex_home_dir_name`] covers every variant, and neither matches the
+/// `runtime*`/`sessions*` predicates GC and the config reconcilers act on.
+fn codex_home_stem(isolation: Isolation) -> &'static str {
+    match isolation {
+        Isolation::Shared => CODEX_HOME_STEM,
+        Isolation::Isolated => "codex-home-isolated",
+    }
+}
+
+/// The `(home, sessions)` dir names a codex session of this flavor uses under
+/// this transport — [`paired_dir_names`]'s codex twin, with the same
+/// [`LinkMode::Fake`] collapse to the bare stems. Under the bare SHARED stem
+/// the home is the profile-global store itself, which is the fake-mode sharing
+/// story in one line: no symlinks, so the durable state is simply lived in.
+fn codex_paired_dir_names(isolation: Isolation, session: &str, mode: LinkMode) -> (String, String) {
+    let suffix = match mode {
+        LinkMode::Real => format!("-{session}"),
+        LinkMode::Fake => String::new(),
+    };
+    (
+        format!("{}{suffix}", codex_home_stem(isolation)),
+        format!("{}{suffix}", isolation.sessions_stem()),
+    )
+}
+
+/// Whether `name`'s sessions run under the fake-symlink transport — where a
+/// codex session home holds a COPY of `auth.json`, not a symlink to the
+/// store. The standby refresh reads this: under real symlinks a live session
+/// reads the very file a rotation writes (codex reloads before spending, the
+/// guard serializes), but under fake mode it holds a separate carrier, so a
+/// store rotation would spend a token the session still holds. Only meaningful
+/// when the profile dir exists (a live session guarantees it).
+pub(crate) fn profile_uses_fake_transport(name: &str) -> bool {
+    let Ok(dir) = profile_dir(&ProfileName::from(name)) else {
+        return false;
+    };
+    matches!(detect_link_mode(&dir), Ok(LinkMode::Fake))
+}
+
+/// The durable per-profile codex store, `profiles/<name>/codex-home` — the
+/// symlink target for the state that must outlive one session (the sqlite
+/// stores, `history.jsonl`, the rollout roots).
+fn codex_global_home(name: &str) -> Result<PathBuf> {
+    profile_subpath(&ProfileName::from(name), CODEX_HOME_STEM)
+}
+
+/// The config keys a clauth-built codex home must not inherit, whatever the
+/// operator set for their own `~/.codex`. Each one lets a session read or write
+/// outside the boundary the home exists to draw:
+///
+/// - `sqlite_home` moves the state DBs, so every profile's
+///   goals/logs/memories/state land in one directory and the home's durable
+///   links are never opened through.
+/// - `cli_auth_credentials_store` makes codex ignore the linked `auth.json` and
+///   delete it on the first refresh (decision 6).
+/// - `debug.config_lockfile` replays a lockfile as the WHOLE effective config:
+///   `ConfigLayerStack::new(vec![lock_layer], ..)` (codex `core/src/config/mod.rs`)
+///   rebuilds from one layer, so the `-c` layer carrying both forced overrides
+///   is not outranked but ERASED.
+///
+/// The first two are also pinned by a forced `-c` at spawn. Stripping them here
+/// too is deliberate: the third key is what makes a `-c` alone insufficient, and
+/// a defense that only holds while the layer stack survives is not one.
+const CODEX_CONFIG_STRIP_KEYS: &[&str] = &["sqlite_home", "cli_auth_credentials_store"];
+const CODEX_CONFIG_STRIP_SUBKEYS: &[(&str, &str)] = &[("debug", "config_lockfile")];
+
+/// Copy the operator's `config.toml` into a session home with the escape keys
+/// removed. An unparseable config copies through verbatim: codex will reject it
+/// the same way, and a session that cannot start is a better answer than one
+/// silently reshaped by a parse this function got wrong. Comments and key order
+/// are lost in the rewrite, which costs nothing — the copy is codex's to write
+/// in place and is discarded at teardown, never synced back over the original.
+///
+/// Every branch lands owner-only: the copy sits in a tree the perms sweep
+/// stops short of, so the operator's own mode would otherwise be what it keeps.
+fn copy_codex_config(src: &Path, dst: &Path) -> Result<()> {
+    let raw = std::fs::read(src).with_context(|| format!("failed to read {}", src.display()))?;
+    let bytes = match stripped_codex_config(&raw) {
+        Some(parsed) => toml::to_string(&parsed)
+            .with_context(|| format!("failed to re-render {}", src.display()))?
+            .into_bytes(),
+        None => raw,
+    };
+    crate::profile::atomic_write_600(dst, bytes)
+        .with_context(|| format!("failed to write {}", dst.display()))
+}
+
+/// The parsed config with the escape keys removed, or `None` when there was
+/// nothing to strip or the bytes do not parse, so the copy goes verbatim.
+fn stripped_codex_config(raw: &[u8]) -> Option<toml::Value> {
+    let mut parsed = toml::from_str::<toml::Value>(str::from_utf8(raw).ok()?).ok()?;
+    let table = parsed.as_table_mut()?;
+    let mut stripped = false;
+    for key in CODEX_CONFIG_STRIP_KEYS {
+        stripped |= table.remove(*key).is_some();
+    }
+    for (parent, key) in CODEX_CONFIG_STRIP_SUBKEYS {
+        if let Some(sub) = table.get_mut(*parent).and_then(toml::Value::as_table_mut) {
+            stripped |= sub.remove(*key).is_some();
+        }
+    }
+    stripped.then_some(parsed)
+}
+
+/// The sqlite stores (with their `-wal`/`-shm` companions, per the plan's
+/// table) plus the history file — per-session paths symlinked into the
+/// profile-global home so memory survives session teardown. The companions
+/// ride along deliberately: a write through a dangling symlink CREATES its
+/// target, so the bytes land in the store whichever path sqlite derives the
+/// auxiliary names from — linking them makes the layout correct without
+/// betting on sqlite's symlink resolution. A store name a future codex adds
+/// stays per-session until this list learns it — a bounded, visible
+/// degradation, against silently linking anything.
+const CODEX_DURABLE_ENTRIES: &[&str] = &[
+    "goals_1.sqlite",
+    "goals_1.sqlite-wal",
+    "goals_1.sqlite-shm",
+    "logs_2.sqlite",
+    "logs_2.sqlite-wal",
+    "logs_2.sqlite-shm",
+    "memories_1.sqlite",
+    "memories_1.sqlite-wal",
+    "memories_1.sqlite-shm",
+    "state_5.sqlite",
+    "state_5.sqlite-wal",
+    "state_5.sqlite-shm",
+    "thread_history_1.sqlite",
+    "thread_history_1.sqlite-wal",
+    "thread_history_1.sqlite-shm",
+    "history.jsonl",
+];
+
+/// The rollout roots a codex home keeps side by side: live threads under
+/// `sessions/`, and the ones the operator archived under `archived_sessions/`
+/// (codex `rollout/src/lib.rs`). Both link into the profile-global home the
+/// way the durable entries do, so a rollout is in the store the moment codex
+/// writes it and every later session lists it. Archiving MOVES a rollout
+/// between them, so linking only the first would rename an archived thread
+/// out of the store into the per-session home, and "archive this thread"
+/// would mean "delete it at teardown" — the one operation whose whole promise
+/// is that the thread is kept.
+const CODEX_ROLLOUT_ROOTS: &[&str] = &["sessions", "archived_sessions"];
+
+/// The operator-`~/.codex` entries a SHARED codex session sees — instruction
+/// and extension surfaces, same reasoning as the claude shared runtime linking
+/// the operator's `~/.claude`. `hooks.json` is deliberately absent: hooks
+/// execute code inside a home clauth built, so linking it is a per-profile
+/// opt-in ([`CodexProfileOpts::hooks_json`]), never a default.
+const CODEX_OPERATOR_ENTRIES: &[&str] = &[
+    "skills",
+    "rules",
+    "agents",
+    "templates",
+    "references",
+    "AGENTS.md",
+    // Installed plugins (`plugins/cache`, `plugins/data` — codex
+    // `core-plugins/src/store.rs`) are the operator's tooling, the same family
+    // as skills and rules, so they are LINKED rather than made durable
+    // per-profile: an install reaches every profile and outlives the session
+    // that made it. Unlinked they were neither, and a plugin installed inside a
+    // clauth session died with the home.
+    "plugins",
+];
+
+/// Which side alone could have written since the last convergence — the
+/// tie-breaker once neither `last_refresh` nor mtime separates the two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConvergePrior {
+    /// Between sessions only the store is written (the standby leg, a
+    /// capture). A same-flavor session live beside this build writes the copy
+    /// stamped, so the stamp branch settles it first: the prior only breaks a
+    /// full tie no live writer produces.
+    Build,
+    /// The session was the only live writer (the standby leg stands down for
+    /// a live fake-transport session), and it writes the copy.
+    Teardown,
+}
+
+/// Converge the profile store and a fake-mode home's `auth.json` copy at a
+/// session boundary; content-equal is a no-op. The chain's own event decides:
+/// the later `last_refresh` wins, mtime only where a side has no parseable
+/// stamp, and a remaining tie goes to the boundary's [`ConvergePrior`]. A tie
+/// sent to the store hands a SPENT refresh token back to a copy the session
+/// just rotated — the permanent-death shape on a coarse-mtime filesystem — so
+/// which side wins a tie is a fact about who could have written, not a
+/// default. One direction is never enough: store→copy alone never carries a
+/// rotation out, copy→store alone undoes a re-capture at the next start. The
+/// claude fake transport mirrors per tick; codex has no watchdog, so the
+/// boundaries are its convergence points and mid-session divergence its cost.
+fn converge_fake_codex_auth(store: &Path, copy: &Path, prior: ConvergePrior) -> Result<()> {
+    match (store.exists(), copy.exists()) {
+        (false, false) => Ok(()),
+        (true, false) => copy_file(store, copy),
+        // The store must never lag a chain that exists only in the copy: the
+        // rotation and capture machinery read the STORE.
+        (false, true) => copy_file(copy, store),
+        (true, true) => {
+            if files_match(store, copy).unwrap_or(false) {
+                return Ok(());
+            }
+            let copy_wins = match (last_refresh_ms_of(copy), last_refresh_ms_of(store)) {
+                (Some(c), Some(s)) if c != s => c > s,
+                _ => match (file_mtime(copy), file_mtime(store)) {
+                    (Some(c), Some(s)) if c != s => c > s,
+                    _ => prior == ConvergePrior::Teardown,
+                },
+            };
+            if copy_wins {
+                copy_file(copy, store)
+            } else {
+                copy_file(store, copy)
+            }
+        }
+    }
+}
+
+/// The `last_refresh` stamp of an `auth.json` on disk, `None` for a file that
+/// does not parse or carries none.
+fn last_refresh_ms_of(path: &Path) -> Option<i64> {
+    let bytes = std::fs::read(path).ok()?;
+    crate::codex_auth::CodexAuth::parse(&bytes)
+        .ok()?
+        .last_refresh_ms()
+}
+
+/// The per-profile codex knobs, read from the profile's own `config.toml` —
+/// the file the reload fingerprint already walks. A codex profile's config is
+/// never read by the claude `load_profile`, so this minimal shape is its one
+/// reader and unknown keys stay tolerated.
+#[derive(Default, serde::Deserialize)]
+struct CodexProfileOpts {
+    /// Link the operator's `~/.codex/hooks.json` into shared session homes.
+    #[serde(default)]
+    hooks_json: bool,
+}
+
+fn codex_profile_opts(name: &str) -> CodexProfileOpts {
+    let Ok(path) = profile_subpath(&ProfileName::from(name), "config.toml") else {
+        return CodexProfileOpts::default();
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(raw) => toml::from_str(&raw).unwrap_or_default(),
+        Err(_) => CodexProfileOpts::default(),
+    }
+}
+
+/// Build one codex session home. Additive over an existing tree, like the
+/// claude build: a link already in place is left alone, so a rebuild over a
+/// live shared tree cannot yank entries out from under a sibling.
+///
+/// The table (from the codex plan):
+/// - `auth.json` — under real symlinks, BOTH flavors link the profile's own
+///   `profiles/<name>/auth.json`: one physical file is what makes concurrent
+///   carriers safe (codex's own reload-and-skip handles codex-vs-codex, the
+///   rotation guard handles clauth-vs-codex). Under [`LinkMode::Fake`] it is
+///   a copy — the same consequences the claude fake-mode credential copy
+///   already documents, sharpened by codex's single-use refresh chain: the
+///   copy is a second carrier whose refreshes strand the store, and a
+///   fake-mode host accepts that or does not run codex sessions.
+/// - `config.toml` — a COPY of the operator's (codex writes it in place, so a
+///   link would mutate the operator's own file). Absent operator config copies
+///   nothing.
+/// - the operator surfaces ([`CODEX_OPERATOR_ENTRIES`]) — shared flavor only,
+///   links (fake: copies); isolated links nothing from the operator.
+/// - the durable stores ([`CODEX_DURABLE_ENTRIES`]) — shared flavor under real
+///   symlinks: links into the profile-global home, dangling until codex
+///   creates through them, which is the point. Isolated: per-session. Fake:
+///   the home IS the global store, nothing to link.
+/// - the rollout roots ([`CODEX_ROLLOUT_ROOTS`]) — shared flavor under real
+///   symlinks: links into the profile-global home, their targets created
+///   first (codex creates `sessions/<yyyy>/<mm>/<dd>/` through them, and a
+///   `create_dir_all` cannot pass a dangling dir link). Isolated: a real
+///   per-session `sessions/`, discarded by design. Fake: the home IS the
+///   global store.
+fn build_codex_home(home: &Path, name: &str, isolation: Isolation, mode: LinkMode) -> Result<()> {
+    let operator = home_dir()?.join(".codex");
+    let global = codex_global_home(name)?;
+    let auth_store = profile_subpath(&ProfileName::from(name), "auth.json")?;
+
+    let place = |src: &Path, dst: &Path| -> Result<()> {
+        if dst.symlink_metadata().is_ok() || !src.exists() {
+            return Ok(());
+        }
+        match mode {
+            LinkMode::Real => link_entry(src, dst),
+            LinkMode::Fake => copy_tree(src, dst),
+        }
+    };
+
+    // The one physical auth.json. Placed even while the store is absent (a
+    // captured login can arrive after the first start): a dangling link reads
+    // as "no credentials" to codex today and as the store the moment it
+    // exists. Under Fake the store and the home's copy CONVERGE at every
+    // session boundary (here, and again at teardown) — see
+    // [`converge_fake_codex_auth`] for why one direction is not enough.
+    let auth_dst = home.join("auth.json");
+    match mode {
+        LinkMode::Real => {
+            if auth_dst.symlink_metadata().is_err() {
+                link_entry(&auth_store, &auth_dst)?;
+            }
+        }
+        LinkMode::Fake => converge_fake_codex_auth(&auth_store, &auth_dst, ConvergePrior::Build)?,
+    }
+
+    let operator_config = operator.join("config.toml");
+    if operator_config.exists() && home.join("config.toml").symlink_metadata().is_err() {
+        copy_codex_config(&operator_config, &home.join("config.toml"))?;
+    }
+    // `codex --profile <name>` layers `$CODEX_HOME/<name>.config.toml` over the
+    // base config, and CODEX_HOME is this session home — so without these the
+    // flag resolves to an empty layer and silently runs the base config. They
+    // are sanitized like the base file: a layer can spell the same escapes.
+    if let Ok(entries) = std::fs::read_dir(&operator) {
+        for entry in entries.flatten() {
+            let file_name = entry.file_name();
+            let Some(name) = file_name.to_str() else {
+                continue;
+            };
+            if !name.ends_with(".config.toml") {
+                continue;
+            }
+            let dst = home.join(name);
+            if dst.symlink_metadata().is_err() {
+                copy_codex_config(&entry.path(), &dst)?;
+            }
+        }
+    }
+
+    if isolation == Isolation::Shared {
+        for entry in CODEX_OPERATOR_ENTRIES {
+            place(&operator.join(entry), &home.join(entry))?;
+        }
+        if codex_profile_opts(name).hooks_json {
+            place(&operator.join("hooks.json"), &home.join("hooks.json"))?;
+        }
+        if mode == LinkMode::Real {
+            crate::profile::mkdir_700(&global)
+                .with_context(|| format!("failed to create {}", global.display()))?;
+            for entry in CODEX_DURABLE_ENTRIES {
+                let dst = home.join(entry);
+                if dst.symlink_metadata().is_err() {
+                    link_entry(&global.join(entry), &dst)?;
+                }
+            }
+            for root in CODEX_ROLLOUT_ROOTS {
+                let target = global.join(root);
+                crate::profile::mkdir_700(&target)
+                    .with_context(|| format!("failed to create {}", target.display()))?;
+                let dst = home.join(root);
+                if dst.symlink_metadata().is_err() {
+                    link_entry(&target, &dst)?;
+                }
+            }
+        }
+    }
+
+    let sessions = home.join("sessions");
+    if sessions.symlink_metadata().is_err() {
+        crate::profile::mkdir_700(&sessions)
+            .with_context(|| format!("failed to create {}", sessions.display()))?;
+    }
+    Ok(())
+}
+
+/// Live codex session guard — the codex [`ProfileRuntime`]. On drop: converges
+/// a fake-mode auth copy back to the store, carries a durable store codex
+/// healed in place back into the profile-global home, drops the registry row
+/// and marker, and removes the per-session home (its rollout roots are links,
+/// so the rollouts stay in the store); the bare `codex-home` (the durable
+/// store, and the fake-mode shared home) is never removed.
+pub(crate) struct CodexRuntime {
+    home: PathBuf,
+    sessions: PathBuf,
+    pid_file: PathBuf,
+    session: SessionId,
+    profile: String,
+    isolation: Isolation,
+    mode: LinkMode,
+    _pid_lock: File,
+}
+
+impl CodexRuntime {
+    pub(crate) fn acquire(name: &str, isolation: Isolation) -> Result<Self> {
+        let owned = ProfileName::from(name);
+        let profile_root = profile_dir(&owned)?;
+        // Same ordering rule as the claude acquire: RotationGuard outermost,
+        // state flock inside. What it buys here is the row: `launch_store` and
+        // the marker must be visible before any clauth-side codex rotation
+        // (phase 4) can decide against this profile, or the rotation gate
+        // reads the account as idle while a session is mid-start on it.
+        let _rotation_guard = RotationGuard::acquire(&owned)?;
+
+        let (session, home, sessions, pid_file, pid_lock, mode) = with_state_lock(|_held| {
+            crate::profile::mkdir_700(&profile_root)
+                .with_context(|| format!("failed to create {}", profile_root.display()))?;
+            let mode = detect_link_mode(&profile_root)?;
+            let mut session = SessionId::mint();
+            let (mut home_name, mut sessions_name) =
+                codex_paired_dir_names(isolation, session.as_str(), mode);
+            for _ in 0..SID_COLLISION_REMINTS {
+                let pid_file = profile_subpath(&owned, &sessions_name)?.join(session.as_str());
+                if !is_session_alive(&pid_file) {
+                    break;
+                }
+                session = SessionId::mint();
+                (home_name, sessions_name) =
+                    codex_paired_dir_names(isolation, session.as_str(), mode);
+            }
+            let home = profile_subpath(&owned, &home_name)?;
+            let sessions = profile_subpath(&owned, &sessions_name)?;
+            let pid_file = sessions.join(session.as_str());
+
+            // Decision 8 lets codex sessions run concurrently because they share
+            // ONE physical auth.json. Under Fake there is no sharing: the two
+            // flavors collapse to DIFFERENT bare stems, each holding its own
+            // COPY converged from the same store. Two live flavors are then two
+            // carriers of one single-use chain with no reload-and-skip between
+            // them (codex's own answer needs one inode), and the first refresh
+            // on either side strands the other for good. Same flavor is fine —
+            // that IS one home. Refusing is what the premise actually supports.
+            if mode == LinkMode::Fake {
+                let other = isolation.other();
+                let (_, other_sessions_name) =
+                    codex_paired_dir_names(other, session.as_str(), mode);
+                let other_sessions = profile_subpath(&owned, &other_sessions_name)?;
+                if other_sessions.exists() && !matches!(live_sessions_at(&other_sessions), Some(0))
+                {
+                    anyhow::bail!(
+                        "'{name}' already has a live {other} codex session, and this host \
+                         cannot symlink — the two would hold SEPARATE copies of one \
+                         single-use chain, and the first refresh on either strands the \
+                         other. Close it before starting a {isolation} one"
+                    );
+                }
+            }
+
+            crate::profile::mkdir_700(&sessions)
+                .with_context(|| format!("failed to create {}", sessions.display()))?;
+            let active = prune_stale_sessions(&sessions).unwrap_or(1);
+            // A dead session's leftovers under a recycled sid are rebuilt from
+            // scratch — but ONLY a genuinely per-session home. Testing the
+            // SHARED bare stem alone was not enough: under Fake every name is
+            // sid-free, so the isolated home (`codex-home-isolated`) read as
+            // per-session and was wiped. That home holds a physical auth.json
+            // COPY, and a session that died before Drop could converge leaves
+            // the rotated chain nowhere else — the wipe destroyed it, and
+            // `build_codex_home` then converged the SPENT store token back out
+            // for codex to replay into `refresh_token_reused`. The predicate
+            // that already answers this correctly demands a session id, so
+            // both bare stems keep the state that must outlive a session.
+            if active == 0
+                && home
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(is_per_session_codex_home_name)
+                && home.symlink_metadata().is_ok()
+            {
+                std::fs::remove_dir_all(&home)
+                    .with_context(|| format!("failed to clear {}", home.display()))?;
+            }
+            crate::profile::mkdir_700(&home)
+                .with_context(|| format!("failed to create {}", home.display()))?;
+            build_codex_home(&home, name, isolation, mode)?;
+
+            let file = open_pid_file(&pid_file)
+                .with_context(|| format!("failed to open {}", pid_file.display()))?;
+            if let Err(e) = file.try_lock() {
+                anyhow::bail!(
+                    "failed to claim session marker {}: {e}. Another live process \
+                     holds this session id",
+                    pid_file.display()
+                );
+            }
+
+            // Register inside the same hold, marker already flock-held — the
+            // row never exists without a liveness signal. `launch_store` is
+            // the auth.json THIS SESSION READS — which is what the rotation
+            // refusal must test (the #59 review's one-liner, honored by
+            // intent): under real symlinks the home's auth.json IS
+            // profiles/<name>/auth.json, and under the fake transport it is
+            // the copy the session actually holds, where the accepted
+            // spelling would name a file the session never reads.
+            let row = crate::live_sessions::LiveSession::starting(
+                &session,
+                name,
+                crate::harness::Harness::Codex,
+                isolation == Isolation::Isolated,
+                false,
+                Some(home.join("auth.json")),
+            );
+            if let Err(e) = crate::live_sessions::register(&row) {
+                logline!("clauth: registering the live codex session failed: {e}");
+            }
+            Ok::<_, anyhow::Error>((session, home, sessions, pid_file, file, mode))
+        })?;
+
+        Ok(Self {
+            home,
+            sessions,
+            pid_file,
+            session,
+            profile: name.to_string(),
+            isolation,
+            mode,
+            _pid_lock: pid_lock,
+        })
+    }
+
+    /// The home this session's `CODEX_HOME` pins.
+    pub(crate) fn home(&self) -> &Path {
+        &self.home
+    }
+}
+
+impl Drop for CodexRuntime {
+    fn drop(&mut self) {
+        // The teardown half of the fake-mode auth convergence: a chain the
+        // session rotated in the copy reaches the store NOW, not at some next
+        // start that may never come — and a rotation or capture between
+        // sessions reads a store that is not stale.
+        if self.mode == LinkMode::Fake
+            && let Ok(store) =
+                profile_subpath(&ProfileName::from(self.profile.as_str()), "auth.json")
+            && let Err(e) = converge_fake_codex_auth(
+                &store,
+                &self.home.join("auth.json"),
+                ConvergePrior::Teardown,
+            )
+        {
+            logline!("clauth: codex auth converge at teardown failed: {e:#}");
+        }
+        // Carry a durable store codex healed in place back into the
+        // profile-global home — best-effort, never failing a completed
+        // session, and a no-op when the home IS the store (fake shared) or
+        // the flavor keeps its state per-session (isolated).
+        if self.isolation == Isolation::Shared
+            && self.mode == LinkMode::Real
+            && let Ok(global) = codex_global_home(&self.profile)
+        {
+            // codex's own corrupt-DB recovery RENAMES the path it was handed
+            // (`state/src/runtime/recovery.rs`) — and the path it was handed is
+            // our symlink, so the rename moves the LINK into the home's
+            // db-backups and codex writes a fresh REAL file in its place. The
+            // corrupt bytes stay in the store untouched, so without this the
+            // healed DB dies with the session and every later one relinks to the
+            // same corruption and recovers again, forever. A regular file where
+            // this build placed a link is exactly that signal.
+            for entry in CODEX_DURABLE_ENTRIES {
+                let healed = self.home.join(entry);
+                let Ok(meta) = healed.symlink_metadata() else {
+                    continue;
+                };
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    continue;
+                }
+                if let Err(e) = copy_file(&healed, &global.join(entry)) {
+                    logline!("clauth: codex {entry} recovery sync-back failed: {e:#}");
+                }
+            }
+        }
+
+        if let Err(e) = with_state_lock(|_held| {
+            if let Err(e) = crate::live_sessions::unregister(self.session.as_str()) {
+                logline!("clauth: unregistering the live codex session failed: {e}");
+            }
+            if let Err(e) = std::fs::remove_file(&self.pid_file)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                logline!("clauth: remove pid file failed: {e}");
+            }
+            let still_active = prune_stale_sessions(&self.sessions).unwrap_or(1);
+            if still_active == 0 {
+                // Never the bare stem: under Fake the shared home is the
+                // profile's durable store, and removing it would be removing
+                // the profile's memory because the last session left.
+                if self.home.file_name().and_then(|n| n.to_str()) != Some(CODEX_HOME_STEM) {
+                    let _ = std::fs::remove_dir_all(&self.home);
+                }
+                let _ = std::fs::remove_dir(&self.sessions);
+            }
+            Ok::<_, anyhow::Error>(())
+        }) {
+            logline!("clauth: codex session teardown failed: {e:#}");
+        }
+    }
 }
 
 #[cfg(test)]

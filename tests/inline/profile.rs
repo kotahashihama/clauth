@@ -1909,6 +1909,56 @@ fn usage_cache_write_creates_restricted_file_and_dir() {
     );
 }
 
+/// The perms sweep stops at a codex home's threshold: the home NODE keeps the
+/// 0700 invariant, while the PATH-alias helper binaries codex plants inside
+/// keep their exec bits — a blanket 0600 would break them. The exemption is
+/// positional, so a claude profile literally NAMED `codex-home` (the charset
+/// allows it) is still a profile dir and still fully retightened.
+#[cfg(unix)]
+#[test]
+fn the_perms_sweep_stops_at_a_codex_homes_threshold() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _home = HomeSandbox::new();
+    let clauth = clauth_dir().expect("clauth_dir");
+
+    let codex_home = clauth.join("profiles").join("cx").join("codex-home-4242-0");
+    std::fs::create_dir_all(&codex_home).expect("mkdir codex home");
+    let helper = codex_home.join("codex-alias");
+    std::fs::write(&helper, b"#!/bin/sh\n").expect("write helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+    std::fs::set_permissions(&codex_home, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+
+    let impostor = clauth.join("profiles").join("codex-home");
+    std::fs::create_dir_all(&impostor).expect("mkdir impostor profile");
+    std::fs::write(impostor.join("config.toml"), b"").expect("write config");
+    std::fs::set_permissions(
+        impostor.join("config.toml"),
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .expect("chmod");
+
+    enforce_clauth_perms(&clauth);
+
+    let mode =
+        |p: &std::path::Path| std::fs::metadata(p).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(
+        mode(&codex_home),
+        0o700,
+        "the home node itself keeps the invariant"
+    );
+    assert_eq!(
+        mode(&helper),
+        0o755,
+        "the helper binary inside keeps its exec bits"
+    );
+    assert_eq!(
+        mode(&impostor.join("config.toml")),
+        0o600,
+        "a profile NAMED codex-home is a profile dir, retightened in full"
+    );
+}
+
 /// Installs from before the 0o600/0o700 rule carry a umask-moded tree that no
 /// writer ever revisits: bytes that never change keep their mode forever. Every
 /// entry point loads the config, so that is where the tree gets retightened.
@@ -2100,6 +2150,28 @@ fn reload_fingerprint_changes_when_profiles_toml_mtime_bumps() {
     assert_ne!(
         before, after,
         "a profiles.toml mtime bump must change the fingerprint"
+    );
+}
+
+/// A codex switch or chain edit writes `codex-profiles.toml` and nothing else,
+/// so the fingerprint must move on that file appearing and on its mtime alone
+/// — otherwise the TUI and daemon would run on stale codex state forever.
+#[test]
+fn reload_fingerprint_covers_the_codex_state_file() {
+    let _home = crate::testutil::HomeSandbox::new();
+    let dir = clauth_dir().expect("clauth dir");
+    std::fs::create_dir_all(&dir).expect("mkdir .clauth");
+    let before = reload_fingerprint();
+    let path = dir.join("codex-profiles.toml");
+    std::fs::write(&path, "profiles = []\n").expect("write codex state");
+    let appeared = reload_fingerprint();
+    assert_ne!(before, appeared, "the file appearing must shift it");
+    let later = std::time::SystemTime::now() + std::time::Duration::from_secs(10);
+    crate::testutil::set_mtime(&path, later);
+    assert_ne!(
+        appeared,
+        reload_fingerprint(),
+        "a bare mtime bump must shift it"
     );
 }
 
@@ -3378,5 +3450,103 @@ fn routing_endpoint_reads_env_first_and_a_blank_entry_is_no_override() {
         p.routing_endpoint(),
         Some("https://api.deepseek.com/anthropic"),
         "a blank entry is no override"
+    );
+}
+
+// ── [serve] ────────────────────────────────────────────────────────────────
+
+/// `[serve]` round-trips like `[herdr]`: a set key loads, a default state
+/// serializes no `[serve]` block, and a partial table fills from the default.
+#[test]
+fn a_serve_table_round_trips() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nsession_creation = true\n")
+        .expect("write profiles.toml");
+
+    let loaded = load_app_state().expect("load");
+    assert!(loaded.serve.session_creation, "the [serve] key loads");
+
+    save_app_state(&AppState::default()).expect("save default");
+    let raw = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !raw.contains("[serve]"),
+        "a default [serve] is omitted:\n{raw}"
+    );
+
+    std::fs::write(&path, "profiles = []\n\n[serve]\n").expect("partial table");
+    let partial = load_app_state().expect("load partial");
+    assert!(
+        !partial.serve.session_creation,
+        "a missing key fills from the default"
+    );
+}
+
+/// A key inside `[serve]` that `ServeSettings` does not model is dropped on the
+/// next save WHILE the table renders (its modelled key is non-default), the
+/// same as a stray `[herdr]` key: the table is a closed struct, not a carried
+/// map. The default-table case carries the whole table — see the sibling test.
+#[test]
+fn a_stray_serve_key_is_dropped_while_the_table_renders_non_default() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(
+        &path,
+        "profiles = []\n\n[serve]\nsession_creation = true\nstray = \"gone\"\n",
+    )
+    .expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(state.serve.session_creation, "the modelled key loads");
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        !after.contains("stray"),
+        "the stray key is dropped:\n{after}"
+    );
+    assert!(
+        after.contains("session_creation = true"),
+        "the modelled key survives:\n{after}"
+    );
+}
+
+/// At its default on disk the whole `[serve]` table is itself unmodelled (the
+/// round-trip render omits it), so the carry keeps the table, stray included.
+#[test]
+fn a_default_serve_table_carries_a_stray_key() {
+    let _home = HomeSandbox::new();
+    let path = app_state_path().expect("app_state_path");
+    crate::profile::mkdir_700(path.parent().expect("parent")).expect("mkdir");
+    std::fs::write(&path, "profiles = []\n\n[serve]\nstray = \"gone\"\n").expect("write");
+
+    let state = load_app_state().expect("load");
+    assert!(
+        !state.serve.session_creation,
+        "the table loads at its default"
+    );
+    save_app_state(&state).expect("save");
+
+    let after = std::fs::read_to_string(&path).expect("read");
+    let parsed: toml::Table = after.parse().expect("whole file parses as TOML");
+    assert_eq!(
+        parsed.get("serve").and_then(|serve| serve.get("stray")),
+        Some(&toml::Value::String("gone".into())),
+        "the carried key stays inside the [serve] table:\n{after}"
+    );
+    assert!(
+        parsed.get("stray").is_none(),
+        "the carried key must not be hoisted to the top level:\n{after}"
+    );
+    assert!(
+        after.contains(PRESERVED_KEYS_MARKER),
+        "the carry sits under the preserved-keys marker:\n{after}"
+    );
+    let marker = after.find(PRESERVED_KEYS_MARKER).expect("marker present");
+    assert!(
+        after[marker..].contains("[serve]"),
+        "the carried [serve] table lands after the marker:\n{after}"
     );
 }

@@ -70,7 +70,7 @@ const SCOPES: &str = "org:create_api_key user:profile user:inference user:sessio
 const LOGIN_TIMEOUT_SECS: u64 = 600;
 
 /// Base64url without padding (RFC 4648 §5) — the encoding OAuth PKCE mandates.
-fn base64url_nopad(input: &[u8]) -> String {
+pub(crate) fn base64url_nopad(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
@@ -108,27 +108,52 @@ pub(crate) fn percent_encode(s: &str) -> String {
     out
 }
 
-/// Inverse of [`percent_encode`] for the callback query values. `+` → space.
+/// Inverse of [`percent_encode`] for the callback query values: `+` → space, a
+/// `%` not followed by two hex digits stays literal, and the bytes are read
+/// lossily, so a callback that is not UTF-8 still yields a value to compare.
 pub(crate) fn percent_decode(s: &str) -> String {
+    // `Malformed::Keep` never refuses; the default is the type's other arm.
+    let bytes = percent_decode_bytes(s, true, Malformed::Keep).unwrap_or_default();
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What a `%` not followed by two hex digits does to a decode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Malformed {
+    /// The `%` is copied through as a literal byte (a form value).
+    Keep,
+    /// The whole decode is refused (a path segment).
+    Refuse,
+}
+
+/// The one `%XX` scan behind [`percent_decode`] and the REST router's path
+/// decoder, which differ only in policy: whether `+` reads as a space and what
+/// a malformed `%` does. Decodes from bytes with hex-digit validation: slicing
+/// the `&str` by byte index (as `from_str_radix(&s[i+1..i+3])` would) panics
+/// when a multi-byte UTF-8 char follows a bare `%`, reachable from any process
+/// that hits the loopback port. `None` only under [`Malformed::Refuse`].
+pub(crate) fn percent_decode_bytes(
+    s: &str,
+    plus_is_space: bool,
+    malformed: Malformed,
+) -> Option<Vec<u8>> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
-            // Decode from bytes with hex-digit validation. Slicing the &str by
-            // byte index (as `from_str_radix(&s[i+1..i+3])` would) panics when a
-            // multi-byte UTF-8 char follows a bare '%' — reachable from any local
-            // process that hits the loopback port. Validate first, then compute.
-            b'%' if i + 3 <= bytes.len()
-                && bytes[i + 1].is_ascii_hexdigit()
-                && bytes[i + 2].is_ascii_hexdigit() =>
-            {
-                let hi = (bytes[i + 1] as char).to_digit(16).unwrap_or(0) as u8;
-                let lo = (bytes[i + 2] as char).to_digit(16).unwrap_or(0) as u8;
-                out.push((hi << 4) | lo);
-                i += 3;
-            }
-            b'+' => {
+            b'%' => match bytes.get(i + 1..i + 3).and_then(hex_pair) {
+                Some(byte) => {
+                    out.push(byte);
+                    i += 3;
+                }
+                None if malformed == Malformed::Keep => {
+                    out.push(b'%');
+                    i += 1;
+                }
+                None => return None,
+            },
+            b'+' if plus_is_space => {
                 out.push(b' ');
                 i += 1;
             }
@@ -138,7 +163,16 @@ pub(crate) fn percent_decode(s: &str) -> String {
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    Some(out)
+}
+
+/// The byte two hex digits spell; `None` for anything else. `from_str_radix`
+/// alone would take a leading `+` or `-`, so the digits are checked first.
+fn hex_pair(hex: &[u8]) -> Option<u8> {
+    if hex.len() != 2 || !hex.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    u8::from_str_radix(std::str::from_utf8(hex).ok()?, 16).ok()
 }
 
 /// Percent-decoded value of `key` in an `a=1&b=2` query string. Also serves the
@@ -306,7 +340,7 @@ impl AuthorizeRejection {
     /// Parse the callback's `error` param. The input is discarded here: every
     /// value any arm carries onward is one of this function's own literals, so
     /// nothing downstream can be holding browser-supplied bytes.
-    fn parse(code: &str) -> Self {
+    pub(crate) fn parse(code: &str) -> Self {
         match code {
             "access_denied" => Self::Declined,
             "server_error" => Self::Upstream("server_error"),
@@ -319,7 +353,7 @@ impl AuthorizeRejection {
         }
     }
 
-    fn user_message(&self) -> &'static str {
+    pub(crate) fn user_message(&self) -> &'static str {
         match self {
             Self::Declined => "you declined the authorization request",
             Self::Upstream(_) => "anthropic is having trouble",
@@ -329,7 +363,7 @@ impl AuthorizeRejection {
 
     /// Operator-log rendering: the spec code the user copy withholds, as our own
     /// literal rather than the browser's bytes.
-    fn log_detail(&self) -> &'static str {
+    pub(crate) fn log_detail(&self) -> &'static str {
         match self {
             Self::Declined => "access_denied",
             Self::Upstream(code) | Self::Refused(code) => code,

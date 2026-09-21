@@ -309,6 +309,7 @@ fn oauth_profile(
             plan: Some(PlanInfo {
                 tier: PlanTier::from_profile(Some(plan_type), has_max, has_pro, Some(tier)),
                 subscription_status: None,
+                codex_plan: None,
             }),
             five_hour,
             seven_day: None,
@@ -316,6 +317,8 @@ fn oauth_profile(
             window_dollars: Vec::new(),
             extra_usage: extra,
             spend,
+            codex_limit_reached: None,
+            codex_reset_credits: None,
             open_at: None,
             fetched_at: None,
         }),
