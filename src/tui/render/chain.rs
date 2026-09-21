@@ -767,25 +767,31 @@ fn last_resort_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: boo
 /// naming the member the (exclusive) mark would move away from.
 fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool) -> String {
     // A day list decides the days it names, for every account — so the hint
-    // reads off the lists before the toggle, on both sides of one. With a list
-    // here the toggle answers nothing; with a list elsewhere the toggle still
-    // holds, but only on the days that list leaves alone.
+    // reads off the lists before the toggle, on both sides of one. A list here
+    // does not answer for the days no list claims, so the toggle still speaks
+    // there and the hint has to say both halves; with a list elsewhere the
+    // toggle holds only on the days that list leaves alone.
     if let Some(days) = cfg
         .find(name)
         .map(|p| p.preferred_days.clone())
         .filter(|d| !d.is_empty())
     {
-        let named = days
-            .iter()
-            .map(|d| d.to_string().to_ascii_lowercase())
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("home on {named}, by the day list in this profile's config.toml");
+        let named = crate::profile::render_preferred_days(&days).join(", ");
+        return if on {
+            // 80 columns is the narrow case this card renders at; the tail has
+            // to survive it or the operator reads only the list half.
+            format!("home on {named} by the day list, and on the rest by this toggle")
+        } else {
+            format!("home on {named}, by the day list in this account's config.toml")
+        };
     }
-    let claimed_elsewhere = cfg
-        .profiles
-        .iter()
-        .any(|p| p.name != *name && !p.preferred_days.is_empty());
+    // Only a list that could actually serve stands the toggle down, matching
+    // the claim scan in `is_home_on`.
+    let claimed_elsewhere = cfg.state.fallback_chain.iter().any(|n| {
+        n != name
+            && !crate::fallback::walk_excluded(cfg, n)
+            && cfg.find(n).is_some_and(|p| !p.preferred_days.is_empty())
+    });
     if on {
         return if claimed_elsewhere {
             "work returns to this account on the days no day list claims".to_string()
