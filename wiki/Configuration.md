@@ -193,7 +193,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 | `check_scoped` | bool | `true` | count per-model weekly windows against this account |
 | `last_resort` | bool | `false` | the chain's parking spot |
 | `preferred` | bool | `false` | the home account clauth returns to once it is clear |
-| `preferred_days` | string array | `[]` | weekdays this account is home, in local time; replaces `preferred` on this account when set |
+| `preferred_days` | string array | `[]` | weekdays this account is home, in local time; claims those days against every account, while `preferred` keeps the days no list claims |
 | `max_auto_spend` | float | `0.0` | dollar ceiling on pay-as-you-go fallback |
 | `bell_threshold` | float | none | 5h % that fires a bell toast |
 | `rolling_token` | bool | `false` | daemon re-stamps the sidecar from the usage chain; set by `clauth rolling-token`, cleared by `clauth static-token` (bare or `--clear`) |
