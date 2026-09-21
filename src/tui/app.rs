@@ -2581,8 +2581,7 @@ impl App {
                 // an exhaustion walk onto a clear preferred put us there.
                 let returned = self
                     .config()
-                    .find(&ProfileName::from(target.clone()))
-                    .is_some_and(|p| p.preferred);
+                    .is_home_today(&ProfileName::from(target.clone()));
                 let msg = if returned {
                     format!("returned to preferred account '{target}'")
                 } else {
@@ -10090,7 +10089,7 @@ pub(crate) fn on_tick(app: &mut App) {
         // can also land here when the preferred is the only clear member left —
         // both are genuinely "now on home", so the destination-based label holds
         // without threading the cause through `SwitchAction`.
-        let returning = app.config().find(&name).is_some_and(|p| p.preferred);
+        let returning = app.config().is_home_today(&name);
         let msg = if returning {
             format!("returning to preferred account '{name}'")
         } else {

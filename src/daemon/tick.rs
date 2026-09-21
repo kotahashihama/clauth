@@ -277,7 +277,7 @@ impl super::Daemon {
             // a clear preferred put us there. Captured under the same lock so the
             // log names the two apart without threading the cause through the
             // switch action.
-            let returning = cfg.find(&target).is_some_and(|p| p.preferred);
+            let returning = cfg.is_home_today(&target);
             // A delete landing between the early drop above and this hold is
             // caught by `switch_profile`'s own fresh membership gate
             // (`ensure_switch_target_ok`), which runs inside this same flock.
