@@ -122,6 +122,53 @@ fn an_unclaimed_day_leaves_the_flag_in_charge() {
     assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
 }
 
+// A list on an account the walk never visits claims nothing. Letting it count
+// would stand the flag down on a day its own account can never serve, leaving
+// nobody home — the opposite of what the list was written for.
+#[test]
+fn a_non_members_list_reads_inert() {
+    let mut off_chain = Profile::new("personal".to_string(), None, None);
+    off_chain.preferred_days = vec![Weekday::Sat];
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![flagged, off_chain],
+    };
+
+    assert!(
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        "an off-chain list does not stand the flag down"
+    );
+    assert!(!cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat));
+}
+
+// Same for a member the walk skips: disabled here, and auth-broken and
+// unresolvable read identically through `walk_excluded`. Its days go back to
+// the flag rather than to nobody.
+#[test]
+fn a_dead_members_list_hands_its_days_back_to_the_flag() {
+    let mut dead = Profile::new("personal".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged, dead]);
+
+    assert!(
+        cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat),
+        "a disabled lister leaves saturday to the flag"
+    );
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        "and cannot be home itself"
+    );
+}
+
 // A claimed day is claimed against everyone: the weekend account is home on
 // Saturday and the flagged one stands down, which is the split an operator
 // gets from one line in one profile. Resolving this per profile would leave

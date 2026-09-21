@@ -351,11 +351,12 @@ pub(crate) struct Profile {
     /// here" are contradictory verdicts. Default off. See
     /// `fallback::next_auto_switch_target`'s return-to-preferred pass.
     pub(crate) preferred: bool,
-    /// Weekdays on which this profile is the home account, read in the
+    /// Weekdays on which this account is the home account, read in the
     /// machine's local zone. Empty — the default — leaves `preferred` in
-    /// charge. A named day is claimed against the whole profile list, not just
-    /// this one: see [`AppConfig::is_home_on`], which is where the question is
-    /// actually answered. Lets one account own the weekend without an external
+    /// charge. A named day is claimed against every account, not just this
+    /// one, and `preferred` keeps the days no list claims: see
+    /// [`AppConfig::is_home_on`], which is where the question is actually
+    /// answered and which only lets serving chain members claim. Lets one account own the weekend without an external
     /// job rewriting `config.toml` twice a day.
     pub(crate) preferred_days: Vec<Weekday>,
     /// CLA-ROLL: the daemon re-stamps this profile's `session-token.json` with the
@@ -1134,18 +1135,36 @@ impl AppConfig {
     /// `fallback.rs` rather than as a mistake.
     ///
     /// On a day nobody names, `preferred` decides exactly as before.
+    ///
+    /// Only chain members the walk would actually visit can claim. A profile
+    /// off the chain, or one `walk_excluded` skips (unresolvable, auth-broken,
+    /// disabled), never serves, so letting its list stand the flag down would
+    /// leave the day with nobody home. Reading the chain rather than
+    /// `profiles` follows the spend warning, which is on the chain for the
+    /// same reason.
     pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
-        let claimed = self
-            .profiles
-            .iter()
-            .any(|p| p.preferred_days.contains(&day));
+        let claimed = self.day_listers(day).next().is_some();
         self.find(name).is_some_and(|p| {
             if claimed {
-                p.preferred_days.contains(&day)
+                p.preferred_days.contains(&day) && !crate::fallback::walk_excluded(self, name)
             } else {
                 p.preferred
             }
         })
+    }
+
+    /// Chain members that name `day` and could actually serve it, in chain
+    /// order. Empty when the day is unclaimed, which is what hands it back to
+    /// `preferred`.
+    pub(crate) fn day_listers(&self, day: Weekday) -> impl Iterator<Item = &ProfileName> {
+        self.state
+            .fallback_chain
+            .iter()
+            .filter(move |n| !crate::fallback::walk_excluded(self, n))
+            .filter(move |n| {
+                self.find(n)
+                    .is_some_and(|p| p.preferred_days.contains(&day))
+            })
     }
 
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
@@ -3097,7 +3116,7 @@ fn parse_preferred_days(raw: &[String]) -> Vec<Weekday> {
 
 /// The canonical on-disk spelling: lowercase three-letter names, so a rewrite
 /// of a hand-written `["Saturday", "SUN"]` settles instead of alternating.
-fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
+pub(crate) fn render_preferred_days(days: &[Weekday]) -> Vec<String> {
     days.iter()
         .map(|d| d.to_string().to_ascii_lowercase())
         .collect()
@@ -3180,11 +3199,14 @@ fn render_config_toml(profile: &Profile) -> String {
     }
     out.push('\n');
 
-    out.push_str("# Weekdays this profile is the home account, in local time. Empty (the\n");
-    out.push_str("# default) leaves `preferred` above in charge every day; a non-empty list\n");
-    out.push_str("# replaces it for this profile, so one account can own the work week and\n");
-    out.push_str("# another the weekend. Full names and three-letter forms both parse, and\n");
-    out.push_str("# an entry that does not is dropped on the next rewrite.\n");
+    out.push_str("# Weekdays this account is the home account, in local time. Empty (the\n");
+    out.push_str("# default) leaves `preferred` above in charge every day. A non-empty list\n");
+    out.push_str("# CLAIMS those days against every account — a bare `preferred` elsewhere\n");
+    out.push_str("# stands down on them — while `preferred` still decides the days no list\n");
+    out.push_str("# claims, here and everywhere. Only chain members that could actually\n");
+    out.push_str("# serve claim: a list on a removed, disabled or auth-broken account is\n");
+    out.push_str("# inert. Full names and three-letter forms both parse, and an entry that\n");
+    out.push_str("# does not is dropped on the next rewrite.\n");
     if profile.preferred_days.is_empty() {
         out.push_str("# preferred_days = [\"sat\", \"sun\"]\n");
     } else {
