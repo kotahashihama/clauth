@@ -1549,3 +1549,51 @@ fn a_daemonless_publish_yields_to_a_feed_written_after_its_build_started() {
         "an exactly-equal stamp must skip, not publish"
     );
 }
+
+// ── the headless half of the day-list collision warning ────────────────────
+
+/// The daemon runs with nobody watching a toast, so the collision has to reach
+/// the log — and reach it once. `day_claim_notice` holds the message, so a
+/// tick that re-derives the same state is silent and a claimant change is not.
+#[test]
+fn the_daemon_logs_a_day_collision_once_per_change() {
+    use chrono::Weekday::*;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let all = || vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun];
+    let mut a = blank_profile(&crate::profile::ProfileName::from("work"));
+    a.preferred_days = all();
+    let mut b = blank_profile(&crate::profile::ProfileName::from("personal"));
+    b.preferred_days = all();
+
+    let mut config = persist(vec![a, b], Some("work"), 60_000);
+    config.state.fallback_chain = config.state.profiles.clone();
+    let mut daemon = daemon_for(config);
+
+    daemon.log_day_claim_collision();
+    let first = daemon
+        .day_claim_notice
+        .clone()
+        .expect("two claimants raise a notice");
+    assert!(first.contains("2 accounts claim"), "got {first}");
+
+    daemon.log_day_claim_collision();
+    assert_eq!(
+        daemon.day_claim_notice.as_deref(),
+        Some(first.as_str()),
+        "an unchanged tick leaves the gate where it was"
+    );
+
+    {
+        #[allow(clippy::expect_used)]
+        let mut cfg = daemon.config.lock().expect("config mutex poisoned");
+        if let Some(p) = cfg.find_mut(&crate::profile::ProfileName::from("personal")) {
+            p.preferred_days.clear();
+        }
+    }
+    daemon.log_day_claim_collision();
+    assert_eq!(
+        daemon.day_claim_notice, None,
+        "the gate clears so a collision re-introduced logs again"
+    );
+}

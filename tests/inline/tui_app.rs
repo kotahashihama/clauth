@@ -11853,3 +11853,56 @@ fn a_day_list_on_a_dead_account_saves_with_the_reason_it_claims_nothing() {
         app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
     );
 }
+
+// ── the day-list collision warning ───────────────────────────
+
+/// Every weekday, so a fixture reads the same whatever day the suite runs on.
+fn all_weekdays() -> Vec<chrono::Weekday> {
+    use chrono::Weekday::*;
+    vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun]
+}
+
+/// The chain pass re-derives the claim every tick, so the warning has to be
+/// edge-triggered: once when the collision appears, silent while it stands,
+/// again once the claimants change.
+#[test]
+fn the_day_collision_warning_fires_on_the_edge_only() {
+    use super::warn_day_claim_collision;
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = all_weekdays();
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = all_weekdays();
+    let mut app = app_with_chain(vec![a, b]);
+
+    warn_day_claim_collision(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the collision says itself once");
+    assert!(
+        app.toasts[0].body.contains("2 accounts claim"),
+        "got {:?}",
+        app.toasts[0].body
+    );
+
+    warn_day_claim_collision(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the next tick repaints nothing");
+
+    {
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(&ProfileName::from("personal")) {
+            p.preferred_days.clear();
+        }
+    }
+    warn_day_claim_collision(&mut app);
+    assert_eq!(app.toasts.len(), 1, "clearing the collision says nothing");
+
+    {
+        let mut cfg = app.config();
+        if let Some(p) = cfg.find_mut(&ProfileName::from("personal")) {
+            p.preferred_days = all_weekdays();
+        }
+    }
+    warn_day_claim_collision(&mut app);
+    assert_eq!(app.toasts.len(), 2, "a collision re-introduced warns again");
+}

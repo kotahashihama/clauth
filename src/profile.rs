@@ -1167,6 +1167,36 @@ impl AppConfig {
             })
     }
 
+    /// The day-list collision notice for `day`: what to log and toast when more
+    /// than one chain member that could serve names the same day. `None` on the
+    /// ordinary zero-or-one claimant.
+    ///
+    /// Nothing is broken by a collision — the return pass takes the first
+    /// claimant that reads clear — but the operator wrote two lines expecting
+    /// one home, so the state is worth saying out loud once.
+    ///
+    /// The message doubles as its callers' once-gate key: it names the day and
+    /// the claimants in chain order, so it changes exactly when the midnight
+    /// rollover or a config edit changes what is being warned about, and stays
+    /// byte-equal across every tick in between.
+    pub(crate) fn day_claim_collision(&self, day: Weekday) -> Option<String> {
+        let names: Vec<String> = self.day_listers(day).map(|n| format!("'{n}'")).collect();
+        if names.len() < 2 {
+            return None;
+        }
+        Some(format!(
+            "{} accounts claim {}: {} — the chain returns to whichever of them reads clear first",
+            names.len(),
+            day.to_string().to_ascii_lowercase(),
+            names.join(", "),
+        ))
+    }
+
+    /// [`AppConfig::day_claim_collision`] for today in the machine's local zone.
+    pub(crate) fn day_claim_collision_today(&self) -> Option<String> {
+        self.day_claim_collision(Local::now().weekday())
+    }
+
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called
     /// per chain build rather than at load: the fingerprint that drives a hot
     /// reload is built from `config.toml` mtimes, and midnight moves no file.

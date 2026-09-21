@@ -230,6 +230,90 @@ fn a_typed_day_list_names_the_entry_it_cannot_read() {
     );
 }
 
+// One claimant is the ordinary case the whole feature is for, and zero is
+// every config that never grew a list — neither is worth a word.
+#[test]
+fn one_claimant_or_none_raises_no_collision() {
+    let mut weekend = Profile::new("personal".to_string(), None, None);
+    weekend.preferred_days = vec![Weekday::Sat];
+    let flagged = Profile::new("work".to_string(), None, None);
+    let cfg = config_of(vec![flagged, weekend]);
+
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None, "one claimant");
+    assert_eq!(cfg.day_claim_collision(Weekday::Mon), None, "no claimant");
+}
+
+// Two lists naming the same day break nothing — the return pass takes the
+// first of them that reads clear — but the operator wrote two lines expecting
+// one home, so the notice names the day and both claimants.
+#[test]
+fn two_claimants_raise_a_collision_naming_both() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sat];
+    let cfg = config_of(vec![a, b]);
+
+    let notice = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    assert!(notice.contains("2 accounts claim sat"), "got {notice}");
+    assert!(notice.contains("'work'"), "got {notice}");
+    assert!(notice.contains("'personal'"), "got {notice}");
+}
+
+// A dead account cannot serve the day, so it is not a second claimant — the
+// notice would send the operator to fix a collision that `is_home_on` never
+// saw. Same `walk_excluded` scan the claim itself runs.
+#[test]
+fn a_dead_listers_claim_does_not_count_as_a_collision() {
+    let mut live = Profile::new("work".to_string(), None, None);
+    live.preferred_days = vec![Weekday::Sat];
+    let mut dead = Profile::new("personal".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![live, dead]);
+
+    assert_eq!(cfg.day_claim_collision(Weekday::Sat), None);
+}
+
+// The notice is its callers' once-gate key, so it has to be byte-stable while
+// nothing changes and different once the day or the claimants do. Without
+// this the TUI toast repaints every tick.
+#[test]
+fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sat, Weekday::Sun];
+    let cfg = config_of(vec![a, b]);
+
+    let sat = cfg.day_claim_collision(Weekday::Sat).expect("collision");
+    assert_eq!(
+        cfg.day_claim_collision(Weekday::Sat).as_deref(),
+        Some(sat.as_str()),
+        "the same day re-derives the same bytes"
+    );
+    assert_ne!(
+        cfg.day_claim_collision(Weekday::Sun),
+        Some(sat.clone()),
+        "the rollover changes it"
+    );
+
+    let mut third = Profile::new("spare".to_string(), None, None);
+    third.preferred_days = vec![Weekday::Sat];
+    let mut widened = cfg;
+    widened.state.profiles.push(ProfileName::from("spare"));
+    widened
+        .state
+        .fallback_chain
+        .push(ProfileName::from("spare"));
+    widened.profiles.push(third);
+    assert_ne!(
+        widened.day_claim_collision(Weekday::Sat),
+        Some(sat),
+        "a config edit changes it"
+    );
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.

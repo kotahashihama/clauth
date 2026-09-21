@@ -875,6 +875,12 @@ struct Daemon {
     /// Count of ACTUAL failure-log emissions (post-dedup) — the observable proof a
     /// stuck switch isn't logging 1/tick. Read by tests.
     switch_failure_logs: u64,
+    /// The day-list collision notice last logged, or `None` while no day is
+    /// double-claimed. Same dedup shape as `switch_backoff` above and for the
+    /// same reason: the condition is re-derived every tick, so the message
+    /// itself is the key — it changes at the midnight rollover and on a config
+    /// edit, and is byte-equal in between (`AppConfig::day_claim_collision`).
+    day_claim_notice: Option<String>,
     status_path: PathBuf,
 }
 
@@ -912,6 +918,7 @@ impl Daemon {
             heartbeat: Arc::new(AtomicU64::new(0)),
             switch_backoff: None,
             switch_failure_logs: 0,
+            day_claim_notice: None,
             status_path,
         }
     }
