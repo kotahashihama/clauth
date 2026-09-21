@@ -425,6 +425,45 @@ fn app_state_reads_burn_aware_switching_true() {
     assert!(state.burn_aware_switching);
 }
 
+// `walk_order` (issue #86) defaults to `chain` and its on-disk spelling is
+// the hyphenated `soonest-weekly-reset` — the serde rename is the load
+// boundary, so a rename typo must red here, not on an operator's first save.
+// Unset is omitted from a stock file (the `reset_display` Option contract),
+// and BOTH values round-trip.
+#[test]
+fn app_state_walk_order_defaults_chain_and_both_values_round_trip() {
+    let state: AppState = toml::from_str("profiles = []\n").expect("parse state");
+    assert_eq!(state.walk_order(), WalkOrder::Chain);
+    assert!(
+        state.walk_order.is_none(),
+        "unset stays unset, so a stock file omits the key"
+    );
+
+    let soonest = AppState {
+        walk_order: Some(WalkOrder::SoonestWeeklyReset),
+        ..AppState::default()
+    };
+    let rendered = toml::to_string_pretty(&soonest).expect("render soonest state");
+    assert!(
+        rendered.contains("walk_order = \"soonest-weekly-reset\""),
+        "must render the hyphenated spelling, got:\n{rendered}"
+    );
+    let reparsed: AppState = toml::from_str(&rendered).expect("reparse soonest state");
+    assert_eq!(reparsed.walk_order(), WalkOrder::SoonestWeeklyReset);
+
+    let chain = AppState {
+        walk_order: Some(WalkOrder::Chain),
+        ..AppState::default()
+    };
+    let rendered_chain = toml::to_string_pretty(&chain).expect("render chain state");
+    assert!(
+        rendered_chain.contains("walk_order = \"chain\""),
+        "an explicit chain round-trips, got:\n{rendered_chain}"
+    );
+    let reparsed_chain: AppState = toml::from_str(&rendered_chain).expect("reparse chain state");
+    assert_eq!(reparsed_chain.walk_order(), WalkOrder::Chain);
+}
+
 // On must round-trip explicitly; off (the default) is omitted entirely from
 // the rendered profiles.toml, matching `show_pace`/`count_cache`'s treatment
 // of their own default-off booleans.
@@ -3140,6 +3179,35 @@ fn a_round_trip_through_the_typed_model_keeps_the_extras() {
     assert_eq!(round["claudeAiOauth"]["clientId"], "client-abc");
 }
 
+/// The stamp lands under Claude Code's own key and reads back through the
+/// accessor, from a freshly minted block and from a parsed store alike (#78).
+#[test]
+fn the_rate_limit_tier_stamp_uses_claude_codes_key() {
+    let mut login = pair("access", "refresh");
+    let oauth = login.claude_ai_oauth.as_mut().expect("oauth");
+    assert_eq!(
+        oauth.rate_limit_tier(),
+        None,
+        "a fresh mint carries no tier"
+    );
+    oauth.set_rate_limit_tier("default_claude_max_5x".to_string());
+    assert_eq!(oauth.rate_limit_tier(), Some("default_claude_max_5x"));
+    let round: serde_json::Value = serde_json::to_value(&login).expect("serialize");
+    assert_eq!(
+        round["claudeAiOauth"][RATE_LIMIT_TIER_KEY], "default_claude_max_5x",
+        "serialized as a sibling of accessToken, the shape Claude Code writes"
+    );
+
+    let parsed: ClaudeCredentials = serde_json::from_value(serde_json::json!({
+        "claudeAiOauth": {"accessToken": "a", "rateLimitTier": "default_claude_max_20x"}
+    }))
+    .expect("parse");
+    assert_eq!(
+        parsed.claude_ai_oauth.expect("oauth").rate_limit_tier(),
+        Some("default_claude_max_20x")
+    );
+}
+
 /// A login minted by clauth's own browser flow carries no extras, and the
 /// serialized store must not grow an empty catch-all key for it.
 #[test]
@@ -3205,6 +3273,233 @@ fn pending_recovery_preserves_the_stores_mcp_oauth() {
     assert_eq!(
         after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
         "the MCP-server login survives an interrupted rotation"
+    );
+}
+
+// ── #80 backfill: the usage poll stamps a missing tier into pre-#80 chains ──
+//
+// `clauth login` stamps `rateLimitTier` since #80; a chain minted earlier
+// carries none. The poll's hourly `/profile` leg backfills it (decision 1 of
+// the #80 review), write-if-missing onto the stored chain, under
+// the state flock.
+
+/// A stored chain that predates the stamp, polled with the token the `/profile`
+/// body answered for: the tier lands under Claude Code's own key. A second
+/// call — even with a different polled tier — writes nothing.
+#[test]
+fn the_poll_backfill_stamps_a_missing_tier_into_the_stored_chain() {
+    let _home = HomeSandbox::new();
+    let name = "feed-tier";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(stamped, "a matching chain missing the tier is stamped");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert_eq!(
+        stored["claudeAiOauth"]["rateLimitTier"], "default_claude_max_5x",
+        "the tier lands under Claude Code's own key"
+    );
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let again = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_20x",
+    )
+    .expect("stamp");
+    assert!(!again, "a stamped chain is never rewritten");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the no-op call leaves the store byte-identical"
+    );
+}
+
+/// The tier is evidence about the exact token the `/profile` body answered for:
+/// a chain that moved (a re-login, a concurrent rotation) is never stamped with
+/// a reading that belongs to a superseded pair.
+#[test]
+fn the_poll_backfill_skips_a_chain_the_tier_was_not_fetched_for() {
+    let _home = HomeSandbox::new();
+    let name = "feed-mismatch";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-stored", "rt-stored"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-polled",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(
+        !stamped,
+        "a moved chain is not stamped with a stale reading"
+    );
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert!(
+        stored["claudeAiOauth"].get("rateLimitTier").is_none(),
+        "no tier lands on the mismatched chain"
+    );
+}
+
+/// No OAuth block means nothing to stamp — an api-key profile's store may hold
+/// other top-level blocks but no chain — and no `credentials.json` is ever
+/// created by the backfill.
+#[test]
+fn the_poll_backfill_skips_without_an_oauth_chain() {
+    let _home = HomeSandbox::new();
+    let name = "feed-apikey";
+    crate::testutil::register_names(&[name]);
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "no store, no stamp");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    assert!(
+        !cred_path.exists(),
+        "the backfill never mints a credentials file"
+    );
+
+    // A store carrying blocks but no chain (an MCP login alone) is just as
+    // un-stampable, and is left byte-identical.
+    std::fs::create_dir_all(
+        crate::profile::profile_dir(&crate::profile::ProfileName::from(name)).expect("dir"),
+    )
+    .expect("mkdir");
+    std::fs::write(
+        &cred_path,
+        r#"{"mcpOAuth":{"linear":{"accessToken":"mock-linear"}}}"#,
+    )
+    .expect("write store");
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a chain-less store is never stamped");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the chain-less store is left byte-identical"
+    );
+}
+
+/// A staged rotation means a commit never landed: writing the pre-rotation
+/// pair would move `credentials.json` past the sidecar and get the minted pair
+/// discarded by `recover_pending_credentials`. The backfill stands down.
+#[test]
+fn the_poll_backfill_skips_while_a_rotation_sidecar_is_staged() {
+    let _home = HomeSandbox::new();
+    let name = "feed-sidecar";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-old", "rt-old"));
+    stage_rotated_credentials(
+        &crate::profile::ProfileName::from(name),
+        &pair("at-new", "rt-new"),
+    )
+    .expect("stage");
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let before = std::fs::read(&cred_path).expect("read store");
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-old",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a staged rotation stands the backfill down");
+    assert_eq!(
+        std::fs::read(&cred_path).expect("read store"),
+        before,
+        "the store is untouched while the sidecar sits"
+    );
+    assert!(
+        profile_subpath(
+            &crate::profile::ProfileName::from(name),
+            "credentials.json.pending"
+        )
+        .expect("pending path")
+        .exists(),
+        "the sidecar is left for recovery, not consumed"
+    );
+}
+
+/// The tier write goes through the preserving serializer: a top-level block
+/// the model does not carry (an MCP-server login) survives the stamp.
+#[test]
+fn the_poll_backfill_preserves_other_store_blocks() {
+    let _home = HomeSandbox::new();
+    let name = "feed-preserve";
+    crate::testutil::register_names(&[name]);
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    stored["mcpOAuth"] = serde_json::json!({ "linear": { "accessToken": "mock-linear" } });
+    std::fs::write(&cred_path, serde_json::to_vec(&stored).expect("serialize")).expect("write");
+
+    stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("re-read")).expect("parse");
+    assert_eq!(
+        after["mcpOAuth"]["linear"]["accessToken"], "mock-linear",
+        "the MCP-server login survives the tier stamp"
+    );
+}
+
+/// A persist leg writes nothing for a profile the roster no longer lists: the
+/// poll's work list can lag a concurrent delete/rename by a tick.
+#[test]
+fn the_poll_backfill_skips_an_unconfigured_profile() {
+    let _home = HomeSandbox::new();
+    let name = "feed-gone";
+    seed_committed(name, &pair("at-poll", "rt-poll"));
+
+    let stamped = stamp_rate_limit_tier_if_missing(
+        &crate::profile::ProfileName::from(name),
+        "at-poll",
+        "default_claude_max_5x",
+    )
+    .expect("stamp");
+    assert!(!stamped, "a profile off the roster is never written");
+    let cred_path = profile_subpath(&crate::profile::ProfileName::from(name), "credentials.json")
+        .expect("cred path");
+    let stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&cred_path).expect("read store")).expect("parse");
+    assert!(
+        stored["claudeAiOauth"].get("rateLimitTier").is_none(),
+        "no tier lands off-roster"
     );
 }
 
