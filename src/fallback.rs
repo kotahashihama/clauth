@@ -878,10 +878,12 @@ pub(crate) struct ChainMember {
     /// decoupled from `threshold` (issue #8 follow-up: a threshold no longer
     /// doubles as a sink marker).
     pub(crate) last_resort: bool,
-    /// Mirrors `Profile::preferred` — the operator's home account. At most one
-    /// chain member carries it (radio toggle). Drives the return-to-preferred
-    /// pass in [`next_auto_switch_target`] and preferred-wins wrap-off recovery
-    /// in [`find_recovered_member`].
+    /// Today's home account, resolved by [`AppConfig::is_home_today`] rather
+    /// than read off `Profile::preferred`. On a day some profile names, every
+    /// chain member naming it carries this; on an unclaimed day the bare flag
+    /// decides and at most one does. Drives the return-to-preferred pass in
+    /// [`next_auto_switch_target`] and preferred-wins wrap-off recovery in
+    /// [`find_recovered_member`], both of which walk ALL carriers.
     pub(crate) preferred: bool,
     /// Mirrors `Profile::max_auto_spend` in dollars, `0` when unset — the
     /// member's own ceiling on unattended pay-as-you-go spending.
@@ -1833,13 +1835,23 @@ fn next_auto_switch_target_with_usage(
         // a `last_resort` sink is a refuge ("serve here for free until dead"),
         // not a permanent park — the operator's home account outranks it when
         // home is clear and fresh.
-        if let Some(pref) = snapshot.chain.iter().find(|m| m.preferred)
-            && pref.name != active.name
-            && snapshot.fresh.iter().any(|n| n == &active.name)
-            && let Some(pi) = snapshot.chain.iter().position(|m| m.name == pref.name)
-            && !skip(pi)
-            && clear(&snapshot.chain[pi])
-            && snapshot.fresh.iter().any(|n| n == &pref.name)
+        // Every home member is a candidate, not just the first. A day list can
+        // name more than one account, and on a claimed day they all carry the
+        // marker; taking `find`'s first and then failing the gates below would
+        // bail the whole return pass while a later lister sits clear.
+        if snapshot.fresh.iter().any(|n| n == &active.name)
+            && let Some(pref) = snapshot
+                .chain
+                .iter()
+                .enumerate()
+                .filter(|(_, m)| m.preferred)
+                .find(|(pi, m)| {
+                    m.name != active.name
+                        && !skip(*pi)
+                        && clear(m)
+                        && snapshot.fresh.iter().any(|n| n == &m.name)
+                })
+                .map(|(_, m)| m)
         {
             return Some(SwitchAction::To(pref.name.to_string()));
         }
@@ -2014,8 +2026,12 @@ pub(crate) fn find_recovered_member(
     // `chain` on `decision_fresh_any`, so a preferred reaching here is a trusted
     // read; `recovered(_, false)` matches "recovered on the aggregate" — home
     // beats staying off even while a per-model window still gates it.
-    if let Some(pref) = chain.iter().find(|m| m.preferred)
-        && recovered(pref, false) == Some(true)
+    // Same as the return pass: all home members are candidates, so a first
+    // lister that has not recovered does not hide a later one that has.
+    if let Some(pref) = chain
+        .iter()
+        .filter(|m| m.preferred)
+        .find(|m| recovered(m, false) == Some(true))
     {
         return Some(pref.name.to_string());
     }
