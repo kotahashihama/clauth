@@ -204,7 +204,9 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `last_resort` and `preferred` are radio toggles across the chain: marking one clears it everywhere else, and no account can be both.
 
-`preferred_days` is hand-edited; there is no TUI toggle for it, though the Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`), an entry that does not parse is dropped on the next rewrite, and the list is re-read per chain build, so the rollover at midnight needs no restart.
+`preferred_days` has a `home days` row on the Setup tab: type the weekdays separated by commas or spaces and <kbd>⏎</kbd> saves, an empty field clears the list. The Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`); a hand-written entry that does not parse is dropped on the next rewrite, while the row refuses it and keeps the field open. The list is re-read per chain build, so the rollover at midnight needs no restart.
+
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing — the `home days` row says which of those is in the way, before and after the save.
 
 **A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
 
@@ -213,7 +215,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 preferred_days = ["sat", "sun"]
 ```
 
-Two accounts naming the same day is not rejected, and the earlier chain member wins it — the same first-match rule a hand-edited double `preferred = true` already hits.
+Two accounts naming the same day is not rejected: the chain returns to whichever of them reads clear first, so nothing is left with nobody home. clauth still says so once — a toast in the TUI, a line in the log — and says it again at the midnight rollover or after an edit, never once per tick.
 
 ## Storage layout
 
