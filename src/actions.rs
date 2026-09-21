@@ -834,6 +834,25 @@ pub(crate) fn edit_profile_model(
     })
 }
 
+/// Replace an account's `preferred_days` list and persist it — the Setup tab's
+/// day-row commit.
+///
+/// No `apply_profile_to_claude_settings` follow-up, unlike its model-field
+/// twin: the list is read per chain build (`AppConfig::is_home_today`) and
+/// never stamped into Claude Code's environment, so an edit on the active
+/// account needs no re-stamp to take effect.
+pub(crate) fn edit_profile_preferred_days(
+    config: &mut AppConfig,
+    name: &ProfileName,
+    days: Vec<chrono::Weekday>,
+) -> Result<()> {
+    with_state_lock(|_held| {
+        let profile = config.find_mut(name).context("profile not found")?;
+        profile.preferred_days = days;
+        save_profile(profile)
+    })
+}
+
 /// Apply a preset (`base_url` + `models`) in a single locked transaction. A
 /// preset never carries the api key, so the account's own credential is
 /// preserved. Building the full profile state and writing it once — one lock

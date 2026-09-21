@@ -1486,6 +1486,30 @@ pub(crate) fn walk_excluded(config: &AppConfig, name: &ProfileName) -> bool {
     p.is_none() || config.is_auth_broken(name) || p.is_some_and(Profile::is_disabled)
 }
 
+/// Why a day list on `name` claims nothing, phrased for the editor's refusal;
+/// `None` when the account could actually serve the days it names.
+///
+/// The gates are [`walk_excluded`]'s, plus the chain-membership test that
+/// `AppConfig::is_home_on`'s claim scan runs ahead of it, ordered the way an
+/// operator would fix them: put the account on the chain first, then get it
+/// healthy. Only the first is reported — a list cannot be less inert for
+/// clearing one of two blockers, and naming both reads as two problems.
+pub(crate) fn day_claim_blocker(config: &AppConfig, name: &ProfileName) -> Option<&'static str> {
+    let Some(profile) = config.find(name) else {
+        return Some("no such account");
+    };
+    if !config.state.fallback_chain.iter().any(|n| n == name) {
+        return Some("it is not on the fallback chain");
+    }
+    if profile.is_disabled() {
+        return Some("the account is disabled");
+    }
+    if config.is_auth_broken(name) {
+        return Some("its login is auth-broken");
+    }
+    None
+}
+
 /// [`walk_excluded`] plus canceled, for the UI-thread selection walks
 /// (`next_target`, `fully_clear_target`) that read `Profile.usage` — kept fresh
 /// by `App::apply_usage`. `is_canceled` reads that config-cached plan; the

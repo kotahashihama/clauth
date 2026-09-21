@@ -868,8 +868,9 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
     let rows = config_rows(&app);
     // Full runtime sequence for this fixture (OAuth account, no base url, no
     // overrides, no custom env, holding OAuth credentials): auto-start in the
-    // second slot, the alias overrides collapsed behind `ModelOverrideAdd`, no
-    // env rows, then the login/delete-creds/disabled/delete action tail. A
+    // second slot with the day row beside it, the alias overrides collapsed
+    // behind `ModelOverrideAdd`, no env rows, then the
+    // login/delete-creds/disabled/delete action tail. A
     // future reorder of `config_rows`' row-construction (the `rows.push(...)`
     // builder) reds here; a match-arm reorder elsewhere is unobservable at
     // runtime and isn't what this test guards.
@@ -878,6 +879,7 @@ fn config_rows_account_actions_tail_matches_runtime_order() {
         [
             ConfigRow::Name,
             ConfigRow::AutoStart,
+            ConfigRow::PreferredDays,
             ConfigRow::BaseUrl,
             ConfigRow::Model,
             ConfigRow::ModelOverrideAdd,
@@ -11694,4 +11696,160 @@ fn the_codex_only_view_disarms_the_claude_selection_keys() {
     };
     re_armed(&mut app, HarnessFilter::All, ["b", "a"]);
     re_armed(&mut app, HarnessFilter::Claude, ["a", "b"]);
+}
+
+// ── the Setup tab's day row ─────────────────────────────────────────────────
+
+fn app_with_chain(profiles: Vec<crate::profile::Profile>) -> App {
+    use crate::profile::{AppConfig, AppState};
+    let names: Vec<crate::profile::ProfileName> = profiles.iter().map(|p| p.name.clone()).collect();
+    App::new(AppConfig {
+        state: AppState {
+            profiles: names.clone(),
+            fallback_chain: names,
+            ..AppState::default()
+        },
+        profiles,
+    })
+}
+
+/// The row is an existing account's, next to `auto-start`. The `+ new` form
+/// stays out: the account has no chain seat yet, so a list typed there would
+/// claim nothing and say so on a form that cannot fix it.
+#[test]
+fn the_day_row_sits_with_auto_start_and_skips_the_new_form() {
+    use super::{ConfigRow, config_rows};
+    use crate::profile::Profile;
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.config_draft = None;
+
+    app.profile_cursor = 0;
+    let rows = config_rows(&app);
+    let day = rows
+        .iter()
+        .position(|r| *r == ConfigRow::PreferredDays)
+        .expect("an existing account has the day row");
+    let auto_start = rows
+        .iter()
+        .position(|r| *r == ConfigRow::AutoStart)
+        .expect("an oauth account has auto-start");
+    assert_eq!(
+        day,
+        auto_start + 1,
+        "the two chain-behaviour rows sit together"
+    );
+
+    app.profile_cursor = 1; // the `+ new` action row
+    assert!(
+        !config_rows(&app).contains(&ConfigRow::PreferredDays),
+        "the create form has no day row"
+    );
+}
+
+/// ⏎ parses what was typed, saves it, and reseeds the field with the canonical
+/// spelling — the same settling a rewrite of a hand-written list does, so the
+/// field and the file never disagree about `Saturday` vs `sat`.
+#[test]
+fn committing_a_day_list_saves_and_reseeds_the_canonical_spelling() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
+    draft.preferred_days = InputState::new("Saturday, SUN");
+    draft.active = Some(ConfigRow::PreferredDays);
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .map(|p| p.preferred_days.clone()),
+        Some(vec![chrono::Weekday::Sat, chrono::Weekday::Sun]),
+        "the typed list lands on the profile"
+    );
+    let draft = app
+        .config_draft
+        .as_ref()
+        .expect("draft survives the commit");
+    assert_eq!(draft.preferred_days.value, "sat, sun");
+    assert_eq!(draft.active, None, "the editor closes on a good commit");
+}
+
+/// A word that is not a weekday names itself and leaves the editor open with
+/// the typing intact: the loader drops a bad entry because a file nobody is
+/// watching must still load, but the operator is standing at this field.
+#[test]
+fn a_day_list_typo_names_the_word_and_keeps_the_editor_open() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut app = app_with_chain(vec![Profile::new("work".to_string(), None, None)]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("work"));
+    draft.preferred_days = InputState::new("sat, funday");
+    draft.active = Some(ConfigRow::PreferredDays);
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert!(
+        app.config()
+            .find(&ProfileName::from("work"))
+            .is_some_and(|p| p.preferred_days.is_empty()),
+        "nothing is saved from a list that does not parse"
+    );
+    let draft = app.config_draft.as_ref().expect("draft survives");
+    assert_eq!(
+        draft.active,
+        Some(ConfigRow::PreferredDays),
+        "editor stays open"
+    );
+    assert_eq!(draft.preferred_days.value, "sat, funday", "typing survives");
+    assert!(
+        app.toasts.iter().any(|t| t.body.contains("'funday'")),
+        "the refusal names the word, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+}
+
+/// A list on an account the walk skips is saved and then explained. Refusing
+/// the save would hide a state `is_home_on` already handles; saving it in
+/// silence would leave a row that reads set and does nothing.
+#[test]
+fn a_day_list_on_a_dead_account_saves_with_the_reason_it_claims_nothing() {
+    use super::{ConfigRow, InputState, build_draft_existing, commit_config_field};
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.disabled = true;
+    let mut app = app_with_chain(vec![dead]);
+    app.profile_cursor = 0;
+    let mut draft = build_draft_existing(&app, &ProfileName::from("old"));
+    draft.preferred_days = InputState::new("sat");
+    app.config_draft = Some(draft);
+
+    commit_config_field(&mut app, ConfigRow::PreferredDays);
+
+    assert_eq!(
+        app.config()
+            .find(&ProfileName::from("old"))
+            .map(|p| p.preferred_days.clone()),
+        Some(vec![chrono::Weekday::Sat]),
+        "the list is saved"
+    );
+    assert!(
+        app.toasts
+            .iter()
+            .any(|t| t.body.contains("claims nothing") && t.body.contains("disabled")),
+        "the warning names the blocker, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
 }

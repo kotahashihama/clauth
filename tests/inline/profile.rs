@@ -197,6 +197,39 @@ fn a_listed_day_stands_the_flag_down_elsewhere() {
     assert!(!cfg.is_home_on(&personal, Weekday::Mon));
 }
 
+// The editor's parse takes what a human types: either separator, any case,
+// duplicates collapsed, written order kept.
+#[test]
+fn a_typed_day_list_takes_commas_spaces_and_any_case() {
+    assert_eq!(
+        parse_day_list("sun, Saturday").expect("parses"),
+        vec![Weekday::Sun, Weekday::Sat]
+    );
+    assert_eq!(
+        parse_day_list("SAT sun").expect("parses"),
+        vec![Weekday::Sat, Weekday::Sun]
+    );
+    assert_eq!(
+        parse_day_list("sat, sat").expect("parses"),
+        vec![Weekday::Sat],
+        "a repeat collapses the way the loader's parse does"
+    );
+    assert!(
+        parse_day_list("  ").expect("parses").is_empty(),
+        "an empty field clears the list rather than failing"
+    );
+}
+
+// Where the loader drops a bad entry (a file nobody is watching must still
+// load), the editor names it: the operator is standing at the field.
+#[test]
+fn a_typed_day_list_names_the_entry_it_cannot_read() {
+    assert_eq!(
+        parse_day_list("sat, funday, sun"),
+        Err("funday".to_string())
+    );
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.
