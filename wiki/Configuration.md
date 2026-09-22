@@ -207,7 +207,7 @@ A codex profile's own `config.toml` carries `harness = "codex"` and one optional
 
 `preferred_days` has a `home days` row on the Setup tab: type the weekdays separated by commas or spaces and <kbd>⏎</kbd> saves, an empty field clears the list. The Fallback card's `preferred` row names the days once a list is set, and the Overview's `⌂` follows whichever account is home today. Full names and three-letter forms parse in any case (`["sat", "Sunday"]`); a hand-written entry that does not parse is dropped on the next rewrite, while the row refuses it and keeps the field open. The list is re-read per chain build, so the rollover at midnight needs no restart.
 
-A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing — the `home days` row says which of those is in the way, before and after the save.
+A list only claims from an account the chain walk would actually visit, so one on an account that is off the chain, disabled or auth-broken claims nothing — the `home days` row says which of those is in the way, before and after the save. A list can also go inert later, or arrive by hand-editing the file, so clauth says the same at run time: once a day, naming the account, the reason, and whether another list carried the day or it fell back to `preferred`.
 
 **A named day is claimed against every account.** On a day some list names, only the accounts naming it are home; a bare `preferred = true` elsewhere stands down for that day and takes charge again on the days no list claims. So the usual split is one line in one profile:
 
