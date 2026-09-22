@@ -314,6 +314,34 @@ fn the_collision_notice_is_stable_per_day_and_moves_with_the_claimants() {
     );
 }
 
+// The gap the round-2 review found: `walk_excluded` reads an off-chain account
+// as eligible, so a healthy non-member with a matching list answered home while
+// the lister scan — which walks `fallback_chain` — refused it the same claim.
+// `claimed` has to be true for the branch to be reached, so a chain member has
+// to name the day as well.
+#[test]
+fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
+    let mut member = Profile::new("work".to_string(), None, None);
+    member.preferred_days = vec![Weekday::Sat];
+    let mut off_chain = Profile::new("personal".to_string(), None, None);
+    off_chain.preferred_days = vec![Weekday::Sat];
+
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("personal")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![member, off_chain],
+    };
+
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Sat));
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("personal"), Weekday::Sat),
+        "a healthy account off the chain cannot be home on a day it cannot serve"
+    );
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.

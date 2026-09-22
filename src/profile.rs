@@ -1203,14 +1203,16 @@ impl AppConfig {
     /// `profiles` follows the spend warning, which is on the chain for the
     /// same reason.
     pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
-        let claimed = self.day_listers(day).next().is_some();
-        self.find(name).is_some_and(|p| {
-            if claimed {
-                p.preferred_days.contains(&day) && !crate::fallback::walk_excluded(self, name)
-            } else {
-                p.preferred
-            }
-        })
+        let mut listers = self.day_listers(day);
+        match listers.next() {
+            // Home on a claimed day IS the claimant set, asked of the scan
+            // rather than re-derived beside it. A second predicate drifts:
+            // `walk_excluded` alone reads an off-chain account as eligible, so
+            // a healthy non-member with a matching list answered home here
+            // while the scan refused it the same claim.
+            Some(first) => first == name || listers.any(|n| n == name),
+            None => self.find(name).is_some_and(|p| p.preferred),
+        }
     }
 
     /// Chain members that name `day` and could actually serve it, in chain

@@ -771,10 +771,15 @@ fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool)
     // does not answer for the days no list claims, so the toggle still speaks
     // there and the hint has to say both halves; with a list elsewhere the
     // toggle holds only on the days that list leaves alone.
+    // A list this account could not serve claims nothing, so the branches below
+    // answer instead — the same eligibility the `claimed_elsewhere` scan applies
+    // to the other side. The reason is named on the Setup tab's `home days` row;
+    // repeating it here would put the diagnosis on a card that cannot fix it.
     if let Some(days) = cfg
         .find(name)
         .map(|p| p.preferred_days.clone())
         .filter(|d| !d.is_empty())
+        .filter(|_| crate::fallback::day_claim_blocker(cfg, name).is_none())
     {
         let named = crate::profile::render_preferred_days(&days).join(", ");
         return if on {

@@ -285,6 +285,44 @@ fn preferred_hint_names_the_day_list_when_one_is_set() {
     assert!(hint.contains("home on sat, sun"), "{hint}");
 }
 
+// A list this account could not serve claims nothing, so the card must not
+// promise home on those days — `is_home_on` refuses the same claim. The
+// eligibility check is the one the `claimed_elsewhere` branch already applied
+// to the other side; the reason lives on the Setup tab's `home days` row.
+#[test]
+fn preferred_hint_drops_a_day_list_the_account_cannot_serve() {
+    let mut a = profile("a", 95.0, 20.0, 3600);
+    a.preferred = true;
+    a.preferred_days = vec![chrono::Weekday::Sat];
+    a.disabled = true;
+    let cfg = config_with(vec![a], Some("a"), vec!["a"]);
+    let row = FALLBACK_ROWS
+        .iter()
+        .position(|r| *r == FallbackRow::Preferred)
+        .unwrap();
+
+    let lines = member_detail(
+        &cfg,
+        &crate::profile::ProfileName::from("a"),
+        MemberCard {
+            focused: true,
+            row_cursor: row,
+            width: 80,
+            ..Default::default()
+        },
+    )
+    .0;
+    let hint = lines
+        .iter()
+        .map(line_text)
+        .find(|t| t.contains("\u{2514}"))
+        .expect("hint renders");
+    assert!(
+        !hint.contains("home on sat"),
+        "an inert list must not read as a home day: {hint}"
+    );
+}
+
 // With a list elsewhere the toggle still answers, but only for the days that
 // list leaves alone — the branch the stock wording ("once it's free again")
 // would read as every day.
