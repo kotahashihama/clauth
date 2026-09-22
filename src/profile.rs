@@ -1196,13 +1196,24 @@ impl AppConfig {
     ///
     /// On a day nobody names, `preferred` decides exactly as before.
     ///
-    /// Only chain members the walk would actually visit can claim. A profile
-    /// off the chain, or one `walk_excluded` skips (unresolvable, auth-broken,
-    /// disabled), never serves, so letting its list stand the flag down would
-    /// leave the day with nobody home. Reading the chain rather than
+    /// Only chain members the walk would actually visit are ever home. A
+    /// profile off the chain, or one `walk_excluded` skips (unresolvable,
+    /// auth-broken, disabled), never serves — so its list must not stand the
+    /// flag down and leave the day with nobody home, and its own flag must not
+    /// mark it home on the days no list claims. Reading the chain rather than
     /// `profiles` follows the spend warning, which is on the chain for the
     /// same reason.
     pub(crate) fn is_home_on(&self, name: &ProfileName, day: Weekday) -> bool {
+        // An account the walk would never visit is home on NO day: a list on it
+        // claims nothing, and its flag decides nothing either. One guard at the
+        // entry rather than one per branch — the gap this closes was exactly a
+        // branch that did not repeat the check, and a third branch would repeat
+        // the gap. Redundant on the claimed branch, where `day_listers` has
+        // already applied it; the redundancy is what makes the omission
+        // impossible.
+        if !crate::fallback::serves_the_chain(self, name) {
+            return false;
+        }
         let mut listers = self.day_listers(day);
         match listers.next() {
             // Home on a claimed day IS the claimant set, asked of the scan

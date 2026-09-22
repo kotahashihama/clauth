@@ -1547,8 +1547,21 @@ pub(crate) fn walk_excluded(config: &AppConfig, name: &ProfileName) -> bool {
     p.is_none() || config.is_auth_broken(name) || p.is_some_and(Profile::is_disabled)
 }
 
+/// Whether the chain walk would ever visit `name`: a member of the chain, and
+/// past [`walk_excluded`].
+///
+/// The ONE eligibility behind `AppConfig::is_home_on` — an account the walk
+/// cannot reach is home on no day, whether a list would claim it or the flag
+/// would — and behind the day-list editor's refusal, which needs the same
+/// judgment in the reason form [`day_claim_blocker`] carries. Defined in terms
+/// of that function rather than beside it, so the two cannot drift.
+pub(crate) fn serves_the_chain(config: &AppConfig, name: &ProfileName) -> bool {
+    day_claim_blocker(config, name).is_none()
+}
+
 /// Why a day list on `name` claims nothing, phrased for the editor's refusal;
-/// `None` when the account could actually serve the days it names.
+/// `None` when the account could actually serve the days it names. The reason
+/// form of [`serves_the_chain`].
 ///
 /// The gates are [`walk_excluded`]'s, plus the chain-membership test that
 /// `AppConfig::is_home_on`'s claim scan runs ahead of it, ordered the way an

@@ -342,6 +342,47 @@ fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
     );
 }
 
+// The flag half had the gap the list half did: an account the walk never
+// visits is home on no day, so its `⌂` was marking a homecoming that cannot
+// happen. Both ways of being unreachable are pinned, since one guard answers
+// for both.
+#[test]
+fn a_flag_on_an_account_the_walk_skips_is_home_on_no_day() {
+    let mut disabled = Profile::new("old".to_string(), None, None);
+    disabled.preferred = true;
+    disabled.disabled = true;
+    let cfg = config_of(vec![Profile::new("work".to_string(), None, None), disabled]);
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("old"), Weekday::Mon),
+        "a disabled account carrying the flag is home on no day"
+    );
+
+    let mut off_chain = Profile::new("spare".to_string(), None, None);
+    off_chain.preferred = true;
+    let cfg = AppConfig {
+        state: AppState {
+            profiles: vec![ProfileName::from("work"), ProfileName::from("spare")],
+            fallback_chain: vec![ProfileName::from("work")],
+            ..AppState::default()
+        },
+        profiles: vec![Profile::new("work".to_string(), None, None), off_chain],
+    };
+    assert!(
+        !cfg.is_home_on(&ProfileName::from("spare"), Weekday::Mon),
+        "and neither is one off the chain"
+    );
+}
+
+// The guard must not cost a healthy account its flag: the day is unclaimed, so
+// `preferred` is exactly what should answer.
+#[test]
+fn a_healthy_members_flag_still_answers_an_unclaimed_day() {
+    let mut flagged = Profile::new("work".to_string(), None, None);
+    flagged.preferred = true;
+    let cfg = config_of(vec![flagged]);
+    assert!(cfg.is_home_on(&ProfileName::from("work"), Weekday::Mon));
+}
+
 // A list that cannot claim is worth saying at tick time, not just at save
 // time: it goes inert later (the account leaves the chain, is disabled, its
 // login breaks) and a hand-edited config.toml never passes the editor.
