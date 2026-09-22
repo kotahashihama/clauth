@@ -617,9 +617,11 @@ fn row_hint(row: ConfigRow, snap: &Snap) -> Option<String> {
                 .map(|reason| format!("a day list here would claim nothing: {reason}"));
         }
         ConfigRow::PreferredDays if snap.preferred_days.trim().is_empty() => {
-            "weekdays this account is home (sat, sun) — `preferred` holds every day"
+            "weekdays this account is home (sat, sun) — with none, `preferred` answers"
         }
-        ConfigRow::PreferredDays => "home on these days; `preferred` decides the rest",
+        ConfigRow::PreferredDays => {
+            "home on these days; `preferred` decides the days no list claims"
+        }
         // Gate reasons name the same blockers as the CLI's own refusal copy
         // (`actions::disable_profile`), then the on/off state — checked in that
         // order since a gate can only ever bite the OFF (not-yet-disabled)

@@ -358,8 +358,9 @@ fn preferred_hint_says_which_days_are_left_when_another_account_claims() {
 }
 
 // A list AND the flag on one account is home on the listed days by the list
-// and on the rest by the flag, so naming only the list would read as standing
-// down for the other five.
+// and on the UNCLAIMED days by the flag, so naming only the list would read as
+// standing down for the rest. Not "the rest": a list on another account claims
+// days this toggle does not answer for either.
 #[test]
 fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
     let mut a = profile("a", 95.0, 20.0, 3600);
@@ -389,7 +390,7 @@ fn preferred_hint_adds_the_unclaimed_days_when_the_flag_is_also_on() {
         .expect("hint renders");
     assert!(hint.contains("home on sat, sun"), "{hint}");
     assert!(
-        hint.contains("on the rest by this toggle"),
+        hint.contains("by this toggle on days no list claims"),
         "the tail has to survive 80 columns: {hint}"
     );
 }

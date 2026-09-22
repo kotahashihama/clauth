@@ -783,9 +783,12 @@ fn preferred_hint(cfg: &AppConfig, name: &crate::profile::ProfileName, on: bool)
     {
         let named = crate::profile::render_preferred_days(&days).join(", ");
         return if on {
-            // 80 columns is the narrow case this card renders at; the tail has
-            // to survive it or the operator reads only the list half.
-            format!("home on {named} by the day list, and on the rest by this toggle")
+            // "the rest" over-promised: a list on ANOTHER account claims days
+            // this toggle does not answer for either, so the toggle holds only
+            // what no list claims. 80 columns is the narrow case this card
+            // renders at and only its FIRST wrapped line carries the tail —
+            // hence "days no list claims" rather than "the days ...".
+            format!("home on {named} by the day list, and by this toggle on days no list claims")
         } else {
             format!("home on {named}, by the day list in this account's config.toml")
         };
