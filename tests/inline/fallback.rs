@@ -2544,6 +2544,52 @@ fn return_to_preferred_is_a_no_op_once_already_home() {
     );
 }
 
+// The self-limiting argument above assumed at most ONE home member, which the
+// radio toggle guaranteed. A day list can name two, and then the active is
+// preferred and so is a sibling: the pass excluded only the active itself, so
+// it walked to the sibling — and the next tick walked back, one credential
+// relink per scheduler tick forever. An active that is already home ends the
+// pass before any candidate is considered.
+#[test]
+fn a_home_active_does_not_walk_to_a_second_home_member() {
+    let every_day = || {
+        vec![
+            Weekday::Mon,
+            Weekday::Tue,
+            Weekday::Wed,
+            Weekday::Thu,
+            Weekday::Fri,
+            Weekday::Sat,
+            Weekday::Sun,
+        ]
+    };
+    let mut a = profile_with_util("a", Some(95.0), None);
+    a.preferred_days = every_day();
+    let mut b = profile_with_util("b", Some(95.0), None);
+    b.preferred_days = every_day();
+    let config = config_with_chain(vec![a, b, profile_with_util("c", Some(95.0), None)], "a");
+    let mut snap = snapshot_chain(&config).expect("snapshot");
+    assert!(
+        snap.chain.iter().filter(|m| m.preferred).count() == 2,
+        "the fixture has to put two home members on the chain, got {:?}",
+        snap.chain
+            .iter()
+            .map(|m| (m.name.to_string(), m.preferred))
+            .collect::<Vec<_>>()
+    );
+    snap.fresh = vec![
+        ProfileName::from("a"),
+        ProfileName::from("b"),
+        ProfileName::from("c"),
+    ];
+    let store = store_with_utils(&[("a", 10.0), ("b", 10.0), ("c", 10.0)]);
+    assert_eq!(
+        next_auto_switch_target(&snap, &store),
+        None,
+        "already home, so there is nothing to return to — even with a clear, fresh second home"
+    );
+}
+
 // The other half of the self-limiting argument: when preferred is the SPENT
 // member (the only way the exhaustion walk could ever have left it), the return
 // pass does not fire — the exhausted preferred active drops out of the

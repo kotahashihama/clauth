@@ -1935,8 +1935,16 @@ fn next_auto_switch_target_with_usage(
         // ever have left it when preferred was the SPENT member, so a clear
         // preferred that is not the active means work drifted off it on
         // preferred's own exhaustion and can now come home. The one-shot nature
-        // is structural, not timed: the moment it fires, the active IS preferred
-        // and the `pref != active.name` guard bars any re-fire.
+        // is structural, not timed: the moment it fires, the active IS home and
+        // the `!active.preferred` guard bars any re-fire.
+        //
+        // That guard used to be the per-candidate `pref != active.name`, which
+        // was enough while `preferred` was a radio and at most one member could
+        // hold it. A day list names as many accounts as it likes, so skipping
+        // only the active leaves a SECOND home to walk to — and the next tick
+        // walks back, one credential relink per scheduler tick forever. Asking
+        // whether the active is home, rather than which member it is, is the
+        // form that survives more than one of them.
         //
         // Freshness is a HARD gate on BOTH sides here, unlike the exhaustion
         // walk below where target freshness is only a PREFERENCE (2026-06-28
@@ -1957,7 +1965,8 @@ fn next_auto_switch_target_with_usage(
         // name more than one account, and on a claimed day they all carry the
         // marker; taking `find`'s first and then failing the gates below would
         // bail the whole return pass while a later lister sits clear.
-        if snapshot.fresh.iter().any(|n| n == &active.name)
+        if !active.preferred
+            && snapshot.fresh.iter().any(|n| n == &active.name)
             && let Some(pref) = snapshot
                 .chain
                 .iter()
