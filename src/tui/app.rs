@@ -1917,12 +1917,14 @@ pub(crate) struct App {
     /// offset. Never compiled into the binary.
     #[cfg(test)]
     pub(crate) anim_phase_ms: Option<u64>,
-    /// The day-list collision notice last surfaced, or `None` while no day is
-    /// double-claimed. Holding the MESSAGE rather than a flag is what makes
-    /// the gate right on both axes `AppConfig::day_claim_collision` documents:
-    /// the string carries the day and the claimants, so it goes stale at
-    /// midnight and on a config edit, and is byte-equal on every tick between.
-    pub(crate) day_claim_notice: Option<String>,
+    /// The day-list notices last surfaced, empty while the lists are ordinary.
+    /// Holding the MESSAGES rather than a flag is what makes the gate right on
+    /// both axes `AppConfig::day_claim_collision` documents: each string
+    /// carries the day and the accounts, so it goes stale at midnight and on a
+    /// config edit, and is byte-equal on every tick between. Holding the SET
+    /// rather than one string is what keeps a second notice from repainting
+    /// the first.
+    pub(crate) day_claim_notices: Vec<String>,
     /// Tick counter; advances the activity spinner frame each `on_tick`.
     pub(crate) tick_count: u64,
     pub(crate) quit: bool,
@@ -2329,7 +2331,7 @@ impl App {
             started_at: Instant::now(),
             #[cfg(test)]
             anim_phase_ms: None,
-            day_claim_notice: None,
+            day_claim_notices: Vec::new(),
             tick_count: 0,
             quit: false,
             armed_quit: false,
@@ -10253,31 +10255,36 @@ pub(crate) fn on_tick(app: &mut App) {
     poll_plugin_refresh(app);
     poll_daemon_health(app);
 
-    warn_day_claim_collision(app);
+    warn_day_claim_notices(app);
     update_banner(app);
     app.prune_toasts();
 }
 
-/// Say once, per day and per config change, that more than one account claims
-/// today. Toast for the operator at the keyboard, `logline!` for the record a
-/// headless run leaves behind.
+/// Say once, per day and per config change, what today's day lists are doing
+/// that the operator did not write them to do. Toast for the operator at the
+/// keyboard, `logline!` for the record a headless run leaves behind.
 ///
 /// Gated on the notice text rather than on a bool because the chain pass that
 /// resolves the claim re-runs every tick: an ungated warning would repaint the
 /// same line until midnight, and a bool one would stay silent when the
-/// operator edits a second list in while the first collision is still up.
-/// Clearing on `None` is what lets a collision removed and re-introduced warn
-/// again.
-pub(crate) fn warn_day_claim_collision(app: &mut App) {
-    let notice = app.config().day_claim_collision_today();
-    if notice == app.day_claim_notice {
+/// operator edits a second list in while the first notice is still up.
+/// Dropping a notice out of the set is what lets the same state, removed and
+/// re-introduced, warn again.
+pub(crate) fn warn_day_claim_notices(app: &mut App) {
+    let notices = app.config().day_claim_notices_today();
+    if notices == app.day_claim_notices {
         return;
     }
-    if let Some(msg) = notice.as_deref() {
+    let fresh: Vec<String> = notices
+        .iter()
+        .filter(|m| !app.day_claim_notices.contains(m))
+        .cloned()
+        .collect();
+    for msg in fresh {
         crate::logline::logline!("clauth: {msg}");
-        app.toast(ToastKind::Warning, msg.to_string());
+        app.toast(ToastKind::Warning, msg);
     }
-    app.day_claim_notice = notice;
+    app.day_claim_notices = notices;
 }
 
 /// Re-read the codex roster for the Overview's codex section and the header's

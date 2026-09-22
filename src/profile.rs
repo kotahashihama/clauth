@@ -1254,9 +1254,64 @@ impl AppConfig {
         ))
     }
 
-    /// [`AppConfig::day_claim_collision`] for today in the machine's local zone.
-    pub(crate) fn day_claim_collision_today(&self) -> Option<String> {
-        self.day_claim_collision(Local::now().weekday())
+    /// The passed-over-lister notice for `day`: what to say when an account
+    /// names the day but could not serve it, so its line does nothing.
+    /// `None` when every lister could serve, which is the ordinary case.
+    ///
+    /// The editor warns at save time, but a list goes inert LATER too — the
+    /// account leaves the chain, is disabled, or its login breaks — and a
+    /// hand-edited `config.toml` never passes the editor at all. Neither
+    /// reaches the operator without a tick-time notice.
+    ///
+    /// Same gate-key scheme as [`AppConfig::day_claim_collision`]: the day, the
+    /// blocked accounts in profile-list order, and what became of the day are
+    /// all in the message.
+    pub(crate) fn day_claim_passed_over(&self, day: Weekday) -> Option<String> {
+        let blocked: Vec<String> = self
+            .profiles
+            .iter()
+            .filter(|p| p.preferred_days.contains(&day))
+            .filter_map(|p| {
+                crate::fallback::day_claim_blocker(self, &p.name)
+                    .map(|why| format!("'{}' ({why})", p.name))
+            })
+            .collect();
+        if blocked.is_empty() {
+            return None;
+        }
+        let named = day.to_string().to_ascii_lowercase();
+        // What happened to the day, not just that a line is inert: a carried
+        // day still has somebody home and reads as a stray line, while an
+        // uncarried one has quietly fallen back to the flag.
+        let tail = match self.day_listers(day).next() {
+            Some(carrier) => format!("'{carrier}' carries it"),
+            None => format!("nothing else claims {named}, so `preferred` decides it"),
+        };
+        let subject = if blocked.len() == 1 {
+            "the list on"
+        } else {
+            "the lists on"
+        };
+        Some(format!(
+            "{named}: {subject} {} cannot claim it — {tail}",
+            blocked.join(", ")
+        ))
+    }
+
+    /// Today's day-list notices in the machine's local zone, in a fixed order.
+    ///
+    /// Each entry is its own gate key, so a caller holding the previous set
+    /// emits only what is new rather than repainting the rest — a second list
+    /// arriving must not re-toast a collision the operator has already read.
+    pub(crate) fn day_claim_notices_today(&self) -> Vec<String> {
+        let day = Local::now().weekday();
+        [
+            self.day_claim_collision(day),
+            self.day_claim_passed_over(day),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
     }
 
     /// [`AppConfig::is_home_on`] for today in the machine's local zone. Called

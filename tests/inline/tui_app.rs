@@ -11907,12 +11907,12 @@ fn all_weekdays() -> Vec<chrono::Weekday> {
     vec![Mon, Tue, Wed, Thu, Fri, Sat, Sun]
 }
 
-/// The chain pass re-derives the claim every tick, so the warning has to be
-/// edge-triggered: once when the collision appears, silent while it stands,
-/// again once the claimants change.
+/// Two notices are two gate keys, not one: a passed-over lister arriving while
+/// a collision is still up must raise its own toast and leave the collision's
+/// alone. Holding one string would either repaint both or swallow the second.
 #[test]
-fn the_day_collision_warning_fires_on_the_edge_only() {
-    use super::warn_day_claim_collision;
+fn a_second_day_notice_does_not_repaint_the_first() {
+    use super::warn_day_claim_notices;
     use crate::profile::{Profile, ProfileName};
     let _home = crate::testutil::HomeSandbox::new();
 
@@ -11922,7 +11922,56 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
     b.preferred_days = all_weekdays();
     let mut app = app_with_chain(vec![a, b]);
 
-    warn_day_claim_collision(&mut app);
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 1, "the collision says itself once");
+    let collision = app.toasts[0].body.clone();
+
+    // A third account, off the chain, names the same days: its list is passed
+    // over while the two above still collide.
+    {
+        let mut cfg = app.config();
+        let mut spare = Profile::new("spare".to_string(), None, None);
+        spare.preferred_days = all_weekdays();
+        cfg.state.profiles.push(ProfileName::from("spare"));
+        cfg.profiles.push(spare);
+    }
+    warn_day_claim_notices(&mut app);
+    assert_eq!(
+        app.toasts.len(),
+        2,
+        "the new notice is raised, got {:?}",
+        app.toasts.iter().map(|t| &t.body).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        app.toasts[0].body, collision,
+        "and the collision is not re-raised"
+    );
+    assert!(
+        app.toasts[1].body.contains("'spare'"),
+        "the second names the passed-over account: {}",
+        app.toasts[1].body
+    );
+
+    warn_day_claim_notices(&mut app);
+    assert_eq!(app.toasts.len(), 2, "the next tick repaints neither");
+}
+
+/// The chain pass re-derives the claim every tick, so the warning has to be
+/// edge-triggered: once when the collision appears, silent while it stands,
+/// again once the claimants change.
+#[test]
+fn the_day_collision_warning_fires_on_the_edge_only() {
+    use super::warn_day_claim_notices;
+    use crate::profile::{Profile, ProfileName};
+    let _home = crate::testutil::HomeSandbox::new();
+
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = all_weekdays();
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = all_weekdays();
+    let mut app = app_with_chain(vec![a, b]);
+
+    warn_day_claim_notices(&mut app);
     assert_eq!(app.toasts.len(), 1, "the collision says itself once");
     assert!(
         app.toasts[0].body.contains("2 accounts claim"),
@@ -11930,7 +11979,7 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
         app.toasts[0].body
     );
 
-    warn_day_claim_collision(&mut app);
+    warn_day_claim_notices(&mut app);
     assert_eq!(app.toasts.len(), 1, "the next tick repaints nothing");
 
     {
@@ -11939,7 +11988,7 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
             p.preferred_days.clear();
         }
     }
-    warn_day_claim_collision(&mut app);
+    warn_day_claim_notices(&mut app);
     assert_eq!(app.toasts.len(), 1, "clearing the collision says nothing");
 
     {
@@ -11948,6 +11997,6 @@ fn the_day_collision_warning_fires_on_the_edge_only() {
             p.preferred_days = all_weekdays();
         }
     }
-    warn_day_claim_collision(&mut app);
+    warn_day_claim_notices(&mut app);
     assert_eq!(app.toasts.len(), 2, "a collision re-introduced warns again");
 }

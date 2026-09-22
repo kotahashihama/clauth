@@ -51,7 +51,7 @@ impl super::Daemon {
         // window or this deadline is spent.
         let deadline = Instant::now() + super::WATCHDOG_DEADLINE.saturating_sub(super::TICK);
         self.reload_if_changed();
-        self.log_day_claim_collision();
+        self.log_day_claim_notices();
         if !self.next_drain_skipped(deadline) {
             self.drain_pending_switch();
         }
@@ -68,32 +68,35 @@ impl super::Daemon {
         crate::herdr::heal_detached();
     }
 
-    /// Log once, per day and per config change, that more than one account
-    /// claims today. The headless half of the TUI's toast
-    /// (`tui::app::warn_day_claim_collision`); nothing is broken by a
-    /// collision, but a run with no operator watching still has to leave the
-    /// record of which two lists were in play.
+    /// Log once, per day and per config change, what today's day lists are
+    /// doing that the operator did not write them to do. The headless half of
+    /// the TUI's toast (`tui::app::warn_day_claim_notices`); nothing is broken
+    /// by either state, but a run with no operator watching still has to leave
+    /// the record of which lists were in play.
     ///
     /// Placed after `reload_if_changed` so an edit made this tick is what gets
-    /// reported, and gated on the message so the per-tick re-derivation does
+    /// reported, and gated on the messages so the per-tick re-derivation does
     /// not repaint the same line until midnight.
-    pub(super) fn log_day_claim_collision(&mut self) {
+    pub(super) fn log_day_claim_notices(&mut self) {
         #[allow(
             clippy::expect_used,
             reason = "config mutex poisoning is unrecoverable"
         )]
-        let notice = self
+        let notices = self
             .config
             .lock()
             .expect("config mutex poisoned")
-            .day_claim_collision_today();
-        if notice == self.day_claim_notice {
+            .day_claim_notices_today();
+        if notices == self.day_claim_notices {
             return;
         }
-        if let Some(msg) = notice.as_deref() {
+        for msg in notices
+            .iter()
+            .filter(|m| !self.day_claim_notices.contains(m))
+        {
             logline!("clauth: {msg}");
         }
-        self.day_claim_notice = notice;
+        self.day_claim_notices = notices;
     }
 
     /// Whether the next drain must be skipped rather than handed a wait: the

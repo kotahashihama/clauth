@@ -342,6 +342,57 @@ fn an_off_chain_list_is_not_home_on_a_day_the_chain_claims() {
     );
 }
 
+// A list that cannot claim is worth saying at tick time, not just at save
+// time: it goes inert later (the account leaves the chain, is disabled, its
+// login breaks) and a hand-edited config.toml never passes the editor.
+#[test]
+fn a_passed_over_lister_names_what_became_of_the_day() {
+    let mut carrier = Profile::new("work".to_string(), None, None);
+    carrier.preferred_days = vec![Weekday::Sat];
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![carrier, dead]);
+
+    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    assert!(notice.starts_with("sat:"), "got {notice}");
+    assert!(notice.contains("the list on 'old'"), "got {notice}");
+    assert!(notice.contains("the account is disabled"), "got {notice}");
+    assert!(
+        notice.contains("'work' carries it"),
+        "a carried day still has somebody home, and the notice says who: {notice}"
+    );
+}
+
+// With nobody left to carry it the day is unclaimed, so the flag takes over —
+// a different outcome from the carried case and worth wording apart.
+#[test]
+fn a_passed_over_lister_with_no_carrier_names_the_fallback() {
+    let mut dead = Profile::new("old".to_string(), None, None);
+    dead.preferred_days = vec![Weekday::Sat];
+    dead.disabled = true;
+    let cfg = config_of(vec![dead]);
+
+    let notice = cfg.day_claim_passed_over(Weekday::Sat).expect("a notice");
+    assert!(notice.contains("nothing else claims sat"), "got {notice}");
+    assert!(notice.contains("`preferred` decides it"), "got {notice}");
+}
+
+// The ordinary case says nothing: every lister could serve, so no line is
+// doing anything the operator did not write it to do.
+#[test]
+fn listers_that_can_all_serve_raise_no_passed_over_notice() {
+    let mut a = Profile::new("work".to_string(), None, None);
+    a.preferred_days = vec![Weekday::Sat];
+    let mut b = Profile::new("personal".to_string(), None, None);
+    b.preferred_days = vec![Weekday::Sun];
+    let cfg = config_of(vec![a, b]);
+
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Sat), None);
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Sun), None);
+    assert_eq!(cfg.day_claim_passed_over(Weekday::Mon), None);
+}
+
 // `disabled` (the per-account exclusion toggle) must default to `false` so
 // every existing config.toml written before this field existed keeps loading
 // unchanged, matching `last_resort`'s guarantee above.
