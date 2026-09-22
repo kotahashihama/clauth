@@ -8010,11 +8010,11 @@ fn commit_config_field(app: &mut App, field: ConfigRow) {
 /// load, but here the operator is standing at the field and can fix it.
 ///
 /// A saved list on an account the chain walk would skip claims nothing
-/// (`AppConfig::is_home_on` lets only members past `walk_excluded` claim), so
-/// the save is followed by the reason. Saved rather than refused, and shown
-/// rather than hidden, for the reason the chain picker lists dead accounts:
-/// the state is reachable and the operator is owed the why, not a row that
-/// quietly does nothing.
+/// (`AppConfig::is_home_on` lets only members the claim scan reaches claim), so
+/// the save is followed by the reason. Saved rather than refused because the
+/// state is reachable without this row — a list goes inert when the account
+/// later leaves the chain or its login breaks — and a row that quietly does
+/// nothing is worse than one that says why.
 fn commit_preferred_days(app: &mut App) {
     let Some(name) = app
         .config_draft
@@ -8066,8 +8066,8 @@ fn commit_preferred_days(app: &mut App) {
                 app.toast(
                     ToastKind::Warning,
                     format!(
-                        "saved, but this list claims nothing: {reason}\nthe `preferred` toggle \
-                         still decides those days"
+                        "saved, but this list claims nothing: {reason}\nthe chain decides those \
+                         days without this account"
                     ),
                 );
             }
